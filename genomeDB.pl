@@ -30,6 +30,7 @@ my $overwrite = 'CF';
 my $delimiter = '\|';
 my $position = 1;
 my $BLAST_GBdatabase = 'protein';
+my $bam_for_annotations = 'F';
 
 ###############################################
 ### Parsing arguments                       ###
@@ -92,6 +93,10 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
         if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
             $things_to_do{"read_bam"}=$ARGV[++$i];
         }
+	if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
+	    ++$i;
+	    if ($ARGV[$i] =~ /anno/i) { $bam_for_annotations = 'T'; }
+	}
     }
     elsif ($ARGV[$i] eq '--N50') {
 	$things_to_do{"N50"} = 'all';
@@ -196,7 +201,7 @@ if ($dbh) {
 	    $last_time = time;
 	}
 	else { die "Could not create table scaffolds in database $database_name.\n"; }
-	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
+	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, coverage_median INTEGER, nSNP INTEGER, FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
 	    print "Created table annotations (",time-$last_time,"s).\n";
 	    $last_time = time;
 	}
@@ -316,75 +321,147 @@ if ($dbh) {
     }
 #################################################################################################################################
     if ($things_to_do{'read_bam'}) {
+	$score_cut_off += 33; #  to account for Sanger format Phred quality score
 	if ($things_to_do{'read_bam'} ne 'T') {
-	    if (my $sam = Bio::DB::Sam->new( -bam  => $things_to_do{'read_bam'})) {
-		print "Reading bam file...\n";
+	    #if (my $sam = Bio::DB::Sam->new( -bam  => $things_to_do{'read_bam'})) {
+	    if (-e $things_to_do{'read_bam'} && -e "$things_to_do{'read_bam'}.bai") {
+		#print "Reading bam file...\n";
 		my $sth = $dbh->prepare("SELECT name FROM scaffolds");
+		my $sth_insert = $dbh->prepare("UPDATE scaffolds SET coverage_median=?, coverage_mean=?, coverage_sd=?, coverage_max=?, coverage_min=?, medianSNPdiversity=?, nSNP=? WHERE name=?");
+		my $sth_annotations;
+		my $sth_insert_annotations;
+		if ($bam_for_annotations eq 'T') {
+		    $sth_annotations = $dbh->prepare("SELECT start,end,id FROM annotations WHERE seqid=?");
+		    $sth_insert_annotations = $dbh->prepare("UPDATE annotations SET coverage_median=?, nSNP=?  WHERE seqid=? AND id=?");
+		}
 		my $added_stats = 0;
 		$sth->execute();
-		my $sth_insert = $dbh->prepare("UPDATE scaffolds SET coverage_median=?, coverage_mean=?, coverage_sd=?, coverage_max=?, coverage_min=?, medianSNPdiversity=?, nSNP=? WHERE name=?");
 		print "Processing sequences.\n";
 		$last_time = time;
 		while (my $seq_name = $sth->fetchrow_array()) {
-		    my $depth = 0;
+		    #my $depth = 0;
 		    my $positions = 0;
 		    my @data;
 		    my @SNPdiversity;
-		    my $callback = sub {
-			my ($seqid,$pos,$pileup) = @_;
-			$positions++;
-			my $count=0;
-			my %n_bases;
-			foreach my $p (@$pileup) {
-			    my $ali = $p->alignment;
-			    if ($ali->qscore->[$p->pos - $ali->query->start + $p->indel] > $score_cut_off) {
-				++$n_bases{uc(substr($ali->qseq,$p->pos - $ali->query->start + $p->indel,1))};
+		    my @mpileup = `samtools mpileup -r $seq_name $things_to_do{'read_bam'}`;
+		    if (@mpileup) {
+			while (my $row = shift @mpileup) {
+			    my @columns = split /\t/, $row;
+			    ++$positions;
+			    my %n_bases;
+			    push @data, $columns[3];
+			    my $pos = 0;
+			    for (my $i=0; $i < length $columns[4]; ++$i) {
+				my $base = uc(substr($columns[4],$i,1));
+				if ($base eq ',' || $base eq '.') { $base = uc($columns[2]); }
+				if ($base eq '^') { ++$i; }
+				elsif ($base eq '+' || $base eq '-') {
+				    if (substr($columns[4],$i+1) =~ /^([0-9]+)/) {
+					$i += $1 + length($1);
+				    }
+				}
+				elsif ($base eq 'A' || $base eq 'T' || $base eq 'C' || $base eq 'G') {
+				    if ($pos >= length $columns[5]) { print STDERR "$i $columns[4]  --  $pos $columns[5]"; }
+				    if (ord(substr($columns[5],$pos,1))  > $score_cut_off) {
+					++$n_bases{$base};
+				    }
+				    ++$pos;
+				}
+				elsif ($base eq '*') { ++$pos; }
 			    }
-			    ++$depth;
-			    ++$count;
-			}
-			push @data, $count;
-			if (scalar keys %n_bases > 1) {
-			    my $sum = 0;
-			    my $freq_add = 0;
-			    my $tot=0;
-			    foreach (keys %n_bases) { $tot += $n_bases{$_}; }
-			    foreach my $key (keys %n_bases) {
-				my $freq = $n_bases{$key}/$tot;
-				$sum += $freq**2;
+			    if ($pos != length ($columns[5])-1) { print STDERR "Error in reading char $columns[0] - $columns[1] ($pos, ", length $columns[5], ".\n"; }
+			    if (scalar keys %n_bases > 1) {
+				my $sum = 0;
+				my $freq_add = 0;
+				my $tot=0;
+				foreach (keys %n_bases) { $tot += $n_bases{$_}; }
+				foreach my $key (keys %n_bases) {
+				    my $freq = $n_bases{$key}/$tot;
+				    $sum += $freq**2;
+				}
+				push @SNPdiversity, 1/$sum;
 			    }
-			    push @SNPdiversity, 1/$sum;
+			    else { push @SNPdiversity, -1; }
 			}
-		    };
-		    $sam->fast_pileup($seq_name,$callback);
-		    if ($positions) {
-			@data = sort {$a <=> $b} @data;
-			my $average = 0;
-			foreach (@data) { $average += $_; }
-			$average /= scalar @data;
-			my $sd = 0;
-			foreach (@data) { $sd += ($_-$average)*($_-$average); }
-			$sd /= scalar @data;
-			$sd = sqrt($sd);
-			if ($sth_insert->execute($data[scalar @data/2], $average, $sd, $data[-1], $data[1], $SNPdiversity[(scalar @SNPdiversity)/2], scalar @SNPdiversity, $seq_name)) {
-			    ++$added_stats;
-			    if (!($added_stats % 1000)) {
-				print "Added $added_stats annotations (",time-$last_time,"s).\n";
-				$last_time = time;
+			#my $callback = sub {
+		    #	my ($seqid,$pos,$pileup) = @_;
+	    #		$positions++;
+	    #		my $count=0;
+	    #		my %n_bases;
+	    #		foreach my $p (@$pileup) {
+	    #		    my $ali = $p->alignment;
+	    #		    if ($ali->qscore->[$p->pos - $ali->query->start + $p->indel] > $score_cut_off) {
+	    #			++$n_bases{uc(substr($ali->qseq,$p->pos - $ali->query->start + $p->indel,1))};
+	    #		    }
+	    #		    ++$depth;
+	    #		    ++$count;
+	    #		}
+	    #		push @data, $count;
+	    #		if (scalar keys %n_bases > 1) {
+	    #		    my $sum = 0;
+	    #		    my $freq_add = 0;
+	    #		    my $tot=0;
+	    #		    foreach (keys %n_bases) { $tot += $n_bases{$_}; }
+	    #		    foreach my $key (keys %n_bases) {
+	    #			my $freq = $n_bases{$key}/$tot;
+	    #			$sum += $freq**2;
+	    #		    }
+	    #		    push @SNPdiversity, 1/$sum;
+	    #		}
+	    #	    };
+	    #	    $sam->fast_pileup($seq_name,$callback);
+			if ($positions) {
+			    if ($bam_for_annotations eq 'T') {
+				$sth_annotations->execute($seq_name);
+				while (my ($start,$end,$id) = $sth_annotations->fetchrow_array()) {
+				    my @region_data;
+				    my @region_SNPs;
+				    for (my $i=$start-1; $i < $end && $i < scalar @SNPdiversity && $i < scalar @data; ++$i) {
+					push @region_data, $data[$i];
+					push @region_SNPs, $SNPdiversity[$i];
+				    }
+				    my ($average,$sd) = &get_bam_stats(\@region_data, \@region_SNPs);
+				    $sth_insert_annotations->execute($region_data[scalar @region_data/2], scalar @region_SNPs, $seq_name, $id);
+				}
 			    }
-			}
-			else {
-			    print STDERR "Could not add stats to: $seq_name\n";
-			}
+    
+    			    sub get_bam_stats {
+	    			my $data = shift;
+    				my $SNPs = shift;
+    				@{$data} = sort {$a <=> $b} @{$data};
+    				@{$SNPs} = sort {$a <=> $b} @{$SNPs};
+    				while (@{$SNPs} && $SNPs->[0] < 0) { shift @{$SNPs}; }
+    				my $average = 0;
+    				foreach (@{$data}) { $average += $_; }
+    				$average /= scalar @data;
+    				my $sd = 0;
+    				foreach (@data) { $sd += ($_-$average)*($_-$average); }
+    				$sd /= scalar @data;
+    				$sd = sqrt($sd);
+				return ($average,$sd);
+	    		    }
+	    		    my ($average,$sd) = &get_bam_stats(\@data, \@SNPdiversity);
+	    		    if ($sth_insert->execute($data[scalar @data/2], $average, $sd, $data[-1], $data[1], $SNPdiversity[(scalar @SNPdiversity)/2], scalar @SNPdiversity, $seq_name)) {
+	    			++$added_stats;
+	    			if (!($added_stats % 1000)) {
+	    			    print "Added $added_stats annotations to scaffolds (",time-$last_time,"s).\n";
+	    			    $last_time = time;
+	    			}
+	    		    }
+	    		    else {
+	    			print STDERR "Could not add stats to: $seq_name\n";
+	    		    }
+	    		}
 		    }
-		    else { print STDERR "No pileup for $seq_name.\n"; }
+		    else { print STDERR "No pileup using: samtools mpileup -r $seq_name $things_to_do{'read_bam'}.\n"; }
 		}
+		if ($bam_for_annotations eq 'T') { $sth_annotations->finish(); $sth_insert_annotations->finish(); }
 		$sth_insert->finish();
 		$sth->finish();
 		print "Added stats to $added_stats scaffolds (",time-$last_time,"s).\n";
 		$last_time = time;
 	    }
-    	    else { die "Could not open $things_to_do{'read_bam'}.\n"; }
+    	    else { die "Could not find $things_to_do{'read_bam'} and/or $things_to_do{'read_bam'}.bai.\n"; }
 	}
 	else { die "Need a name of the bam file.\n"; }
     }
