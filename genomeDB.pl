@@ -1,10 +1,12 @@
 #! /usr/bin/perl -w
 
 use strict;
+use FindBin ();
+use lib "$FindBin::Bin";
 use DBI;
 use Bio::DB::Sam;
 use LWP::Simple;
-use translation;
+use sequences;
 
 ####################################################################
 ### Global variables that may or may not be changed by arguments ###
@@ -23,7 +25,7 @@ my $genetic_code = 'standard';
 my $include_mate_in_other_group = 'N';
 my $BLASTtype = 'taxonomy';
 my $protein_query = 'F';
-my %categories = ( 'fungi' => 'Fungi', 'bact' => 'Bacteria' ); # Give your organisms annotations as keys
+my %categories = ( 'fungi' => 'Eukaryota; Fungi; Dikarya; Basidiomycota; Agaricomycotina', 'bact' => 'Bacteria' ); # Give your organisms annotations as keys
 my $ambig_critearia = 1; # The criteria to decide if the classification is ambiguous
                          # The function that use the criteria is evaluate_ambiguity
 my $overwrite = 'CF';
@@ -107,7 +109,7 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
     elsif ($ARGV[$i] eq '--set_genetic_code') {
 	if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
 	    $genetic_code = $ARGV[++$i];
-	    if (!&translation::code_available($genetic_code)) { die "'$genetic_code' is not an available genetic code. Available options are: ", &translation::available_codes_string(), "\n"; }
+	    if (!&sequences::gene_codes_available($genetic_code)) { die "'$genetic_code' is not an available genetic code. Available options are: ", &sequences::available_gene_codes_string(), "\n"; }
 	    
 	}
 	else { die "The argument --set_genetic_code need the name of the code to use to translate triplets, e.g. standard, as next argument.\n"; }
@@ -201,7 +203,7 @@ if ($dbh) {
 	    $last_time = time;
 	}
 	else { die "Could not create table scaffolds in database $database_name.\n"; }
-	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, coverage_median INTEGER, nSNP INTEGER, FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
+	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, coverage_median INTEGER, nSNP INTEGER, GCcontent REAL, FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
 	    print "Created table annotations (",time-$last_time,"s).\n";
 	    $last_time = time;
 	}
@@ -212,9 +214,9 @@ if ($dbh) {
 ###############################################################################
     if ($things_to_do{"read_scaffolds"}) {
 	if ($things_to_do{"read_scaffolds"} ne 'T') {
-	    if (!$taxon) { $taxon = 'empty'; }
+	    if (!$taxon) { $taxon = "'empty'"; }
 	    else { $taxon = "'$taxon'"; }
-	    if (!$note) { $note ='empty'; }
+	    if (!$note) { $note ="'empty'"; }
 	    else { $note = "'$note'"; }
 	    open my $INPUT, "<$things_to_do{'read_scaffolds'}" or die "Could not open $things_to_do{'read_scaffolds'}: $!.\n";
 	    my ($name, $seq);
@@ -268,12 +270,17 @@ if ($dbh) {
 	    open my $INPUT, "<$things_to_do{'read_annotations'}" or die "Could not open $things_to_do{'read_annotations'}: $!.\n";
 	    my $added_anno=0;
 	    print "Reading annotations (expecting GFF3 file).\n";
-	    my $sth = $dbh->prepare("INSERT INTO annotations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+	    my $sth = $dbh->prepare("INSERT INTO annotations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
 	    my @other_columns = ('id', 'name', 'alias', 'parent', 'target', 'gap', 'derives_from', 'note', 'dbxref', 'ontology_term', "is_circular", "extras");
+	    # coverage_median INTEGER, nSNP INTEGER, GCcontent
+	    my $seq_sth = $dbh->prepare("SELECT sequence FROM scaffolds WHERE name=?");
 	    my $begin_sth = $dbh->prepare("BEGIN"); # for faster processing commit will be done explicitly
 	    $begin_sth->execute();
 	    my $commit_sth = $dbh->prepare("COMMIT");
 	    $last_time = time;
+	    my $prev_scaffold;
+	    my $sequence;
+	    my $seq_length;
 	    while (my $row = <$INPUT>) {
 		chomp $row;
 		if (!($row=~ /^#/)) { # if not a comment
@@ -294,6 +301,25 @@ if ($dbh) {
 			else { $values[$#values] .= ";$col=$attributes{$col}"; }
 		    }
 		    foreach (@values) { $dbh->quote($_); }
+		    push @values, -1; # add zero for coverage
+		    push @values, -1; # for nSNP
+		    if (!$prev_scaffold || $values[0] ne $prev_scaffold) {
+			$seq_sth->execute($values[0]);
+			$sequence = $seq_sth->fetchrow_array();
+			$prev_scaffold = $values[0];
+			$seq_length = length($sequence);
+		    }
+		    if ($sequence && $values[3] <= $seq_length) {
+			#my $anno_seq = '';
+			my $start = 0;
+			my $length = 0;
+			if ($values[3] < $values[4]) { $start = $values[3]-1; $length = $values[4]-$values[3]+1; }
+			else { $start = $values[4]-1; $length = $values[3]-$values[4]+1; }
+			#my $anno_seq = substr($sequence, $start, $length);
+			push @values, &sequences::GCcontent(\substr($sequence, $start, $length));
+			#if (@values[$#values] == 0) { print ("$start # $length\n"); }
+		    }
+		    else { push @values, -1.0; }
 		    if ($sth->execute(@values)) {
 			++$added_anno;
 			if (!($added_anno % 5000)) {
@@ -570,7 +596,7 @@ if ($dbh) {
 	else { die "Need name of blast output file.\n"; }
     }
 ######################################################################################
-### Alternative to get output from script                                           ###
+### Alternative to get output from script                                          ###
 ######################################################################################
     if ($things_to_do{'pars_annotations'}) {
 	my $count = 'N';
@@ -598,10 +624,10 @@ if ($dbh) {
 		    while (my ($start,$end,$phase) = $sth_cds->fetchrow_array()) {
 			$seq .= substr($gene_info->[1],$start-1,$end-$start+1);
 		    }	
-		    if ($gene_info->[4] eq '-') { &revcomp(\$seq); }
+		    if ($gene_info->[4] eq '-') { &sequences::revcomp(\$seq); }
 		    print $SEQOUT '>', $gene_info->[5],"\n";
 		    if ($things_to_do{'pars_annotations'} eq 'protein') {
-			print $SEQOUT &translation::translate(\$seq,$genetic_code),"\n";
+			print $SEQOUT &sequences::translateDNA(\$seq,$genetic_code),"\n";
 		    }
 		    else { print $SEQOUT $seq,"\n"; }
 		}
@@ -783,15 +809,15 @@ sub add_to_scaffolds {
     my $seq_ref = shift;
     my $taxon_ref = shift;
     my $note_ref = shift;
-    my $GCcontent = 0;
-    my $length = 0;
-    for (my $i=0; $i< length $$seq_ref; ++$i) {
-	my $char = substr($$seq_ref, $i, 1);
-	if ($char eq 'g' || $char eq 'G' || $char eq 'c' || $char eq 'C') { ++$GCcontent; ++$length; }
-	elsif ($char eq 'a' || $char eq 'A' || $char eq 't' || $char eq 'T') { ++$length; }
-    }
-    if ($length) { $GCcontent/=$length; }
-    else { $GCcontent = 0; }
+    my $GCcontent = &sequences::GCcontent($seq_ref);
+#    my $length = 0;
+#    for (my $i=0; $i< length $$seq_ref; ++$i) {
+#	my $char = substr($$seq_ref, $i, 1);
+#	if ($char eq 'g' || $char eq 'G' || $char eq 'c' || $char eq 'C') { ++$GCcontent; ++$length; }
+#	elsif ($char eq 'a' || $char eq 'A' || $char eq 't' || $char eq 'T') { ++$length; }
+#    }
+#    if ($length) { $GCcontent/=$length; }
+#    else { $GCcontent = 0; }
     return $dbh->do("INSERT INTO scaffolds (name, sequence, GCcontent, taxon, note) VALUES ($$name_ref, $$seq_ref, $GCcontent, $$taxon_ref, $$note_ref)");
 }
 
@@ -806,25 +832,27 @@ sub avarage_and_sd {
     return $avarage, $sd;
 }
 
-sub revcomp {
-    my $dna = shift @_; # parameters passed to the sub
-    $$dna = reverse $$dna;
-    $$dna =~ tr/ACGTacgt/TGCAtgca/; # translate is similar tu substitute but does the substitutions simultaneously
-}
-
 sub process_accno_search {
     my $hits = shift;
     my $delimiter = shift;
     my $position = shift;
     my $BLAST_GBdatabase = shift;
+    my $ntop_hits = 10;
     if ($hits and @{$hits}) {
 	if (${$hits}[0] eq 'no hits') {
             return 'unc';
         }
 	else {
 	    my $organism = 'unc';
-	    for (my $i = 0; $i < scalar @{$hits}; ++$i) {
+	    my @taxonomy;
+	    for (my $i = 0; $i < scalar @{$hits} && $i < $ntop_hits; ++$i) {
 		if (!$hits->[$i]) { next; }
+		{
+		    my @temp = split /\s+/, $hits->[$i];
+		    push @taxonomy, [];
+		    $taxonomy[$#taxonomy]->[0] = pop @temp;
+		    $taxonomy[$#taxonomy]->[1] = pop @temp;
+		}
 		my @annotations = split /$delimiter/, $hits->[$i];
 		my @search;
 	       	if ($BLAST_GBdatabase && $annotations[$position]) {
@@ -835,14 +863,50 @@ sub process_accno_search {
 		else { print "GB database and/or accession number missing.\n"; }
 		my $taxon;
 		foreach (@search) {
-		    if (/\s*ORGANISM\s+(.+)/) { $taxon = $1; }
-		    elsif ($taxon) {
+		    if (/\s*ORGANISM\s+(.+)/) { $taxon = ''; }
+		    elsif (defined($taxon)) {
 			s/\s+/ /g;
 			$taxon .= $_;
 			if (/\.$/) {last; }
 		    }
 		}
-		if ($taxon && $organism eq 'unc') { $organism = $taxon; last;}
+		if ($taxon) { push @{$taxonomy[$#taxonomy]}, split /\s*;\s*/, $taxon }
+	    }
+	    my $taxonstring='';
+	    my $scoresum=0;
+	    foreach (@taxonomy) { $scoresum+= $_->[1]; }
+	    my $cut_off = 0;
+	    my $part_sum = 0;
+	    while ($part_sum < $scoresum/2) { $part_sum += $taxonomy[$cut_off++]->[1]; }
+	    my $done = 'F';
+	    if ($cut_off > 0) {
+		my $pos = 2;
+		while ($done eq 'F') {
+		    my $check = 'F';
+		    my $taxon;
+		    for ( my $i=0; $i < $cut_off-1; ++$i) {
+			if ($pos < scalar @{$taxonomy[$i]} || $pos < scalar @{$taxonomy[$i+1]}) {
+			    $check = 'T';
+			    if ($taxonomy[$i]->[$pos] && $taxonomy[$i+1]->[$pos] && $taxonomy[$i]->[$pos] ne $taxonomy[$i+1]->[$pos]) { $done = 'T'; }
+			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos]; }
+			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos]; }
+			}
+		    }
+		    if ($check eq 'F') { $done = 'T'; }
+		    if ($taxon) {
+			if ($taxonstring) { $taxonstring .= ";$taxon"; }
+			else { $taxonstring = $taxon; }
+		    }
+		    ++$pos;
+		}
+		if ($taxonstring) { $organism = $taxonstring; }
+	    }
+	    elsif (@taxonomy && $taxonomy[0]->[2]) {
+		$taxonstring = $taxonomy[0]->[2];
+		for (my $i=3; $i<scalar @{$taxonomy[0]}; ++$i) {
+		    $taxonstring .= "; $taxonomy[0]->[$i]";
+		}
+		if ($taxonstring) { $organism = $taxonstring; }
 	    }
 	    return $organism;
 	}
@@ -1015,7 +1079,7 @@ sub pars_samtool_view_row_to_hash {
     my $hash_ref = shift;
     if (!$hash_ref->{$columns[0]}) { $hash_ref->{$columns[0]}->[0] = {}; }
     if ($columns[1] & 0x0010) {
-	&revcomp(\$columns[9]);
+	&sequences::revcomp(\$columns[9]);
 	$columns[10] = reverse $columns[10];
 	--$hash_ref->{$columns[0]}->[0]->{'rev'};
     }
@@ -1044,4 +1108,3 @@ sub print_mates {
 	}
     }
 }
-#}
