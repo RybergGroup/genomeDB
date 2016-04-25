@@ -4,7 +4,7 @@ use strict;
 use FindBin ();
 use lib "$FindBin::Bin";
 use DBI;
-use Bio::DB::Sam;
+#use Bio::DB::Sam;
 use LWP::Simple;
 use sequences;
 
@@ -494,11 +494,11 @@ if ($dbh) {
 ######################################################################################
     if ($things_to_do{'pars_blast'}) {
 	if ($things_to_do{'pars_blast'} ne 'T') {
-	    print "Will read BLAST results from $things_to_do{'pars_blast'}.";
+	    print "Will read BLAST results from $things_to_do{'pars_blast'} to uppdate taxon annotation of scaffolds.";
 	    if ($BLASTtype eq 'taxonomy') { print " Assuming first word of each match is a taxon name."; }
 	    elsif ($BLASTtype eq 'accno') { print " Assuming accession number can be found in position $position based on $delimiter, and corresponding annotation can be found in $BLAST_GBdatabase."; }
-	    if ($protein_query eq 'T') { print " Will look for query name in annotations table."; }
-	    else { print " Will look for query name in scaffolds table."; }
+	    if ($protein_query eq 'T') { print " Will look for scaffold name (seqid) by searching id in annotations table."; }
+	    else { print " Will use query name directtly as scaffolds name."; }
 	    if ($overwrite =~ /^C/) { print " Will compare new with old taxon annotation and print if they are different."; }
 	    if ($overwrite =~ /T$/) { print " Will overwrite old annotations."; }
 	    elsif ($overwrite =~ /F$/) { print " Will not overwrite old annotations."; }
@@ -514,47 +514,47 @@ if ($dbh) {
 	    my $begin_sth = $dbh->prepare("BEGIN");
     	    $begin_sth->execute();
 	    my $commit_sth = $dbh->prepare("COMMIT");
-	    while (<$BLAST>) {
-		if (/Query=\s*(.+)/) { # if at new entry
-		    if ($query) {
+	    ### sub to process query results ###
+		    sub process_query {
+			my $query = shift;
+			my $hits = shift;
 			my $taxon;
 			# Get new taxon name
 		       	if ($BLASTtype eq 'taxonomy') {
-			    $taxon = &process_search(\@hits,\%categories,$ambig_critearia);
+			    $taxon = &process_search($hits,\%categories,$ambig_critearia);
 			    if ($categories{$taxon}) { $taxon = $categories{$taxon}; }
 			    elsif ( $taxon eq 'error' ) { print STDERR "Error parsing BLAST query $query.\n"; undef $taxon; }
 			    else { undef $taxon; }
 			}
 			elsif ($BLASTtype eq 'accno') {
-			    $taxon = &process_accno_search(\@hits,$delimiter,$position,$BLAST_GBdatabase);
+			    #print "processing $query.\n";
+			    $taxon = &process_accno_search($hits,$delimiter,$position,$BLAST_GBdatabase);
 			    if ( $taxon eq 'error' ) { print STDERR "Error parsing BLAST query $query.\n"; undef $taxon; }
-			    #print "$taxon\n";
 			}
 			# Insert taxon name
 			if ($taxon && $taxon ne 'unc') {
+			    #print "$query - $taxon\n";
 			    my $insert = 'T';
 			    my $scaffold = $query;
 			    if ($protein_query eq 'T') {
 		    		$sth_protein->execute($query);
 	    			$scaffold = $sth_protein->fetchrow_array();
-				#print "$query - $scaffold\n"
     			    }
 			    if ($scaffold) {
-				#print "$query - $scaffold\n";
-				if ($overwrite eq 'F' || $overwrite eq 'CT' || $overwrite eq 'CF') {
+				if ($overwrite eq 'F' || $overwrite =~ /^C/) {
 				    $sth_check->execute($scaffold);
 				    my $temp = $sth_check->fetchrow_array();
 				    if ($overwrite =~ /^C/ && $temp && $temp ne 'empty' && $temp ne $taxon) {
 					print "BLAST based on $query say taxon should be $taxon for $scaffold.\n\tit is now $temp.\n";
-					if ($overwrite =~/T$/) { print "\tIt will be changed to $taxon."; }
+					if ($overwrite =~/T$/) { print "\tIt will be changed to $taxon.\n"; }
 				    }
 				    if (!$temp || $temp eq 'empty') { $insert = 'T'; }
-				    elsif ($overwrite =~/F$/) { $insert = 'F'; }
+				    elsif ($overwrite =~/F$/ || $temp eq $taxon) { $insert = 'F'; }
 				}
-				#print "$query - $taxon - $scaffold\n";
+				#print "$query - $taxon - $scaffold - $insert\n";
 				if ($insert eq 'T') {
 				    if ( $sth->execute($taxon,$scaffold) ) {
-					#print "$scaffold - $taxon\n";
+					#print "$query - $taxon - $scaffold - $insert\n";
 					++$added_taxa;
 					if (!($added_taxa % 2500)) {
 					    $commit_sth->execute();
@@ -568,15 +568,23 @@ if ($dbh) {
 			    }
 			    else { print STDERR "Could not find scaffold for query: $query\n"; }
 			}
-			elsif ($hits[0] ne 'no hits') { print STDERR "Unable to determine taxon for $query\nBest hit: $hits[0]\n"; }
+			elsif ($hits->[0] ne 'no hits') {
+			    if (!$taxon) { print STDOUT "Parsing failure for $query\n\tBest hit: $hits->[0]\n"; }
+			    else { print STDERR "Unable to determine taxon ($taxon) for $query\n\tBest hit: $hits->[0]\n"; }
+			}
+		    }
+	    while (<$BLAST>) {
+		if (/Query=\s*(.+)/) { # if at new entry
+		    if ($query) {
+			&process_query($query,\@hits);
 		    }
 		    $query = $1;
 		    undef @hits;
 		}
 	    	elsif (/Sequences producing significant alignments:/) { # Reached list of hits
 		    while(<$BLAST>) {
-			if (/^>/) { last; } # hit first alignment
-			elsif (/^\s*(\S.+)/) {
+			if (/^>/ || /^ALIGNMENTS/) { last; } # hit first alignment
+			elsif (/^\s*(.+)/) {
 			    push @hits, $1;
 			}
 		    }
@@ -584,6 +592,9 @@ if ($dbh) {
 		elsif (/\*{5} No hits found \*{5}/) { # No hits
 		    $hits[0] = 'no hits';
 		}
+	    }
+	    if (@hits) { 
+		&process_query($query,\@hits);
 	    }
 	    $commit_sth->execute();
 	    $begin_sth->finish();
@@ -838,39 +849,95 @@ sub process_accno_search {
     my $position = shift;
     my $BLAST_GBdatabase = shift;
     my $ntop_hits = 10;
+    my $FILE = shift;
     if ($hits and @{$hits}) {
-	if (${$hits}[0] eq 'no hits') {
+	if ($hits->[0] eq 'no hits') {
+	    #print "no hits\n";
             return 'unc';
         }
 	else {
 	    my $organism = 'unc';
-	    my @taxonomy;
+	    my @accnos;
 	    for (my $i = 0; $i < scalar @{$hits} && $i < $ntop_hits; ++$i) {
-		if (!$hits->[$i]) { next; }
-		{
-		    my @temp = split /\s+/, $hits->[$i];
-		    push @taxonomy, [];
-		    $taxonomy[$#taxonomy]->[0] = pop @temp;
-		    $taxonomy[$#taxonomy]->[1] = pop @temp;
+		if (!$hits->[$i]) { push @accnos, "empty"; }
+		else {
+		    my @annotations = split /$delimiter/, $hits->[$i];
+		    if ($annotations[$position]) { push @accnos, $annotations[$position]; }
+		    else { push @accnos, "empty"; }
 		}
-		my @annotations = split /$delimiter/, $hits->[$i];
-		my @search;
-	       	if ($BLAST_GBdatabase && $annotations[$position]) {
-		    my $get= get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$annotations[$position]&rettype=gb&retmode=text");
-		    if ($get) { @search = split /\n/, $get; }
-		    else { print STDERR "Could not get taxon annotation from http://eutils.ncbi.nlm.nih.gov for $annotations[$position] in database $BLAST_GBdatabase \n"; }
-		}
-		else { print "GB database and/or accession number missing.\n"; }
-		my $taxon;
-		foreach (@search) {
-		    if (/\s*ORGANISM\s+(.+)/) { $taxon = ''; }
-		    elsif (defined($taxon)) {
-			s/\s+/ /g;
-			$taxon .= $_;
-			if (/\.$/) {last; }
+	    }
+	    my $accno_string = '';
+	    my @search;
+	    if (@accnos) {
+		foreach (@accnos) {
+		    if ($_ ne "empty") {
+			if ($accno_string) { $accno_string .= ",$_"; }
+			else { $accno_string = $_; }
 		    }
 		}
-		if ($taxon) { push @{$taxonomy[$#taxonomy]}, split /\s*;\s*/, $taxon }
+		if (!(defined($FILE))) {
+		    # print "Getting taxon annotations: http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text\n";
+		    my $get= get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text");
+		    if ($get && $get =~ /^Resource temporarily unavailable/) { print STDERR "NCBI eutils temporarily unavailable.\n"; }
+		    elsif ($get) { @search = split /\n/, $get; }
+		    else { print STDERR "No results for $accno_string in $BLAST_GBdatabase.\n"; }
+		}
+	    }
+	    else { print STDERR "Could not pars any accnos.\n"; }
+	    my @taxonomy;
+	    #print "Processing annotations.\n";
+	    for (my $i = 0; $i < scalar @{$hits} && $i < $ntop_hits; ++$i) {
+	       	if ($accnos[$i] && $accnos[$i] ne 'empty') {
+		    {
+			my @temp = split /\s+/, $hits->[$i];
+			push @taxonomy, [];
+			$taxonomy[$#taxonomy]->[0] = pop @temp;
+			$taxonomy[$#taxonomy]->[1] = pop @temp;
+			# print "e-value: $taxonomy[$#taxonomy]->[0]; score: $taxonomy[$#taxonomy]->[1]\n";
+		    }
+		    my $taxon;
+		    my $right_entry = 'F';
+		    my $row;
+		    my $row_n=0;
+		    if ($FILE) { seek $FILE, 0, 0; }
+		    my $condition = 1; # Flag to stop loop
+		    ####### Sub to parse taxon from GB data ########
+		    sub taxon_from_GB {
+			my $row = shift;
+			my $accno = shift;
+			my $right_entry = shift;
+			my $taxon = shift;
+			if ($row =~ /^ACCESSION\s+(\w+)/) {
+			    my $entry = $1;
+			    if ($accno =~ /$entry/) { $right_entry = 'T'; } #print "$accno match $entry.\n"; }
+			    else { $right_entry = 'F'; }#print "$accno does not match $entry.\n";}
+			}
+		     	elsif ($right_entry eq 'T' && $row =~ /\s*ORGANISM\s+(.+)/) { $$taxon = '';}# print "Parsing taxon:\n";}
+		 	elsif (defined($$taxon) && $right_entry eq 'T') {
+	     		    s/\s+//g;
+	 		    $$taxon .= $_;
+			    #print "$$taxon\n";
+     			    if (/\.$/) { $right_entry = 'L'; }
+ 			}
+			return $right_entry;
+		    }
+		    #################################################
+		    if (defined($FILE)) {
+			while (<$FILE>) {
+			    $right_entry = &taxon_from_GB($_,$accnos[$i],$right_entry,\$taxon);
+			    if ( $right_entry eq 'L' ) { last; }
+			}
+		    }
+		    else {
+			foreach (@search) {
+			    $right_entry = &taxon_from_GB($_,$accnos[$i],$right_entry,\$taxon);
+			    if ( $right_entry eq 'L' ) { last; }
+			}
+		    }
+		    if ($taxon) { push @{$taxonomy[$#taxonomy]}, split /\s*;\s*/, $taxon }
+		    else { print STDERR "Could not find taxon annotation for $accnos[$i].\n"; }
+		}
+		else { print STDERR "GB no accession number found for:\n\t $hits->[$i].\n"; }
 	    }
 	    my $taxonstring='';
 	    my $scoresum=0;
@@ -879,7 +946,7 @@ sub process_accno_search {
 	    my $part_sum = 0;
 	    while ($part_sum < $scoresum/2) { $part_sum += $taxonomy[$cut_off++]->[1]; }
 	    my $done = 'F';
-	    if ($cut_off > 0) {
+	    if ($cut_off > 1) {
 		my $pos = 2;
 		while ($done eq 'F') {
 		    my $check = 'F';
@@ -887,19 +954,22 @@ sub process_accno_search {
 		    for ( my $i=0; $i < $cut_off-1; ++$i) {
 			if ($pos < scalar @{$taxonomy[$i]} || $pos < scalar @{$taxonomy[$i+1]}) {
 			    $check = 'T';
-			    if ($taxonomy[$i]->[$pos] && $taxonomy[$i+1]->[$pos] && $taxonomy[$i]->[$pos] ne $taxonomy[$i+1]->[$pos]) { $done = 'T'; }
-			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos]; }
-			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos]; }
+			    #if ($taxonomy[$i]->[$pos]) { print "$i - $taxonomy[$i]->[$pos]\n"; }
+			    #if ($taxonomy[$i+1]->[$pos]) { print "$i+1 - $taxonomy[$i+1]->[$pos]\n"; }
+			    if ($taxonomy[$i]->[$pos] && $taxonomy[$i+1]->[$pos] && $taxonomy[$i]->[$pos] ne $taxonomy[$i+1]->[$pos]) { $done = 'T'; last}
+			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos];}# print "$pos - $taxon\n" }
+			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos];}# print "$pos - $taxon\n" }
 			}
 		    }
 		    if ($check eq 'F') { $done = 'T'; }
-		    if ($taxon) {
-			if ($taxonstring) { $taxonstring .= ";$taxon"; }
+		    if ($done eq 'F' && $taxon) {
+			if ($taxonstring) { $taxonstring .= "; $taxon"; }
 			else { $taxonstring = $taxon; }
 		    }
 		    ++$pos;
 		}
 		if ($taxonstring) { $organism = $taxonstring; }
+		else { print STDERR "No taxon determined for $accno_string.\n"; }
 	    }
 	    elsif (@taxonomy && $taxonomy[0]->[2]) {
 		$taxonstring = $taxonomy[0]->[2];
@@ -908,6 +978,13 @@ sub process_accno_search {
 		}
 		if ($taxonstring) { $organism = $taxonstring; }
 	    }
+	    else {
+		print STDERR "Not able to determin taxon string.\n";
+		if (!@taxonomy) { print STDERR "\tParsing of hits failed.\n"; }
+		elsif (!$taxonomy[0]->[2]) { print STDERR "\tNo taxonomy parsed for first hit.\n"; }
+		elsif ($cut_off == 0) { print STDERR "\tNot able to determin score cut off.\n"; }
+	    }
+	    #print $organism, "\n";
 	    return $organism;
 	}
     }
