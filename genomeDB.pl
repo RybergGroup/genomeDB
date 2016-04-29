@@ -26,7 +26,7 @@ my $include_mate_in_other_group = 'N';
 my $BLASTtype = 'taxonomy';
 my $protein_query = 'F';
 my %categories = ( 'fungi' => 'Eukaryota; Fungi; Dikarya; Basidiomycota; Agaricomycotina', 'bact' => 'Bacteria' ); # Give your organisms annotations as keys
-my $ambig_critearia = 1; # The criteria to decide if the classification is ambiguous
+my $ambig_critearia = 3; # The criteria to decide if the classification is ambiguous
                          # The function that use the criteria is evaluate_ambiguity
 my $overwrite = 'CF';
 my $delimiter = '\|';
@@ -150,7 +150,10 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
 	    else { $overwrite .= 'F'; }
 	    if ( $ARGV[$i]=~ /query:gene/i ) { $protein_query = 'T'; }
 	    else { $protein_query = 'F'; }
-	    if ( $ARGV[$i] =~ /GB:([A-Za-z]+)/i ) { $BLAST_GBdatabase = lc($1); }
+	    if ( $ARGV[$i] =~ /GB:\s*('|")(.+)('|")\s*/i ) {
+		$BLAST_GBdatabase = $2;
+		if (!$BLAST_GBdatabase =~ /file:/i) { $BLAST_GBdatabase = lc($BLAST_GBdatabase); }
+	    }
 	    if ( $ARGV[$i] =~ /annotation:acc/i ) { $BLASTtype = 'accno'; }
 	    if ( $ARGV[$i] =~ /delimiter:(.)/i) {
 		$delimiter = $1;
@@ -159,7 +162,34 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
 		}
 	    }
 	    if ( $ARGV[$i] =~ /position:([0-9]+)/ ) { $position = $1; }
-	    
+	    if ( $ARGV[$i] =~ /taxa:\s*('.+'|".+"|[^;]+)/i ) {
+		undef (%categories);
+		my $temp = $1;
+		$temp =~ s/^\s+//;
+		$temp =~ s/\s+$//;
+		$temp =~ s/^('|")//;
+		$temp =~ s/('|")$//;
+		#print $temp, "\n";
+		if ($temp =~ /file:\s*([^;]+)/i) {
+		    open (TAXA, '<', $1) || die "Could not open $1: $!.\n";
+		    while (<TAXA>) {
+			if (/^#/) { next; }
+			chomp;
+			my @temp = split /\t/;
+			$temp[0] =~ s/^\s+//;
+			$temp[0] =~ s/\s+$//;
+			$temp[1] =~ s/^\s+//;
+			$temp[1] =~ s/\s+$//;
+			$categories{$temp[0]} = $temp[1];
+		    }
+		    close TAXA;
+		}
+		elsif ($temp =~ /,/) {
+		    %categories = split /\s*,\s*/, $temp;
+		}
+		else { die "Unrecognized format for taxa in: $ARGV[$i].\n"; }
+		if (!%categories) { die "Failed to pars taxonomic categories.\n"; }
+	    }
 	}
     }
     elsif ($ARGV[$i] eq '-h' || $ARGV[$i] eq '--help') {
@@ -203,7 +233,7 @@ if ($dbh) {
 	    $last_time = time;
 	}
 	else { die "Could not create table scaffolds in database $database_name.\n"; }
-	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, coverage_median INTEGER, nSNP INTEGER, GCcontent REAL, FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
+	if ($dbh->do("CREATE TABLE annotations (seqid TEXT, source TEXT, type TEXT, start INTEGER, end INTEGER, score REAL, strand TEXT, phase INTEGER, id TEXT, name TEXT, alias TEXT, parent TEXT, target TEXT, gap TEXT, derives_from TEXT, note TEXT, dbxref TEXT, ontology_term TEXT, is_circular TEXT, extras TEXT, coverage_median INTEGER, nSNP INTEGER, GCcontent REAL, PRIMARY KEY (seqid,source,type,start,end,strand) FOREIGN KEY(seqid) REFERENCES scaffolds(name))")) {
 	    print "Created table annotations (",time-$last_time,"s).\n";
 	    $last_time = time;
 	}
@@ -459,10 +489,10 @@ if ($dbh) {
     				while (@{$SNPs} && $SNPs->[0] < 0) { shift @{$SNPs}; }
     				my $average = 0;
     				foreach (@{$data}) { $average += $_; }
-    				$average /= scalar @data;
+    				$average /= scalar @{$data};
     				my $sd = 0;
     				foreach (@data) { $sd += ($_-$average)*($_-$average); }
-    				$sd /= scalar @data;
+    				$sd /= scalar @{$data};
     				$sd = sqrt($sd);
 				return ($average,$sd);
 	    		    }
@@ -495,7 +525,10 @@ if ($dbh) {
     if ($things_to_do{'pars_blast'}) {
 	if ($things_to_do{'pars_blast'} ne 'T') {
 	    print "Will read BLAST results from $things_to_do{'pars_blast'} to uppdate taxon annotation of scaffolds.";
-	    if ($BLASTtype eq 'taxonomy') { print " Assuming first word of each match is a taxon name."; }
+	    if ($BLASTtype eq 'taxonomy') {
+		print " Assuming first word of each match is a taxon name.";
+		foreach(keys %categories) { print " $_ will be interpreted as $categories{$_}."; }
+	    }
 	    elsif ($BLASTtype eq 'accno') { print " Assuming accession number can be found in position $position based on $delimiter, and corresponding annotation can be found in $BLAST_GBdatabase."; }
 	    if ($protein_query eq 'T') { print " Will look for scaffold name (seqid) by searching id in annotations table."; }
 	    else { print " Will use query name directtly as scaffolds name."; }
@@ -514,6 +547,18 @@ if ($dbh) {
 	    my $begin_sth = $dbh->prepare("BEGIN");
     	    $begin_sth->execute();
 	    my $commit_sth = $dbh->prepare("COMMIT");
+	    my %index;
+	    if ($BLAST_GBdatabase =~ /file:(.+)/i) {
+		open (FILE, '<', $1) || die "Could not open $1: $!.\n";
+		print "Indexing $1 ...\n";
+		my $pos;
+		while (<FILE>) {
+		    if (/^LOCUS/) { $pos = tell(FILE); }
+		    if ($pos && /^ACCESSION\s+(\w+)/) { $index{$1} = $pos; $pos = 0;}
+		}
+		print "Done. Proceeding.\n";
+		close FILE;
+	    }
 	    ### sub to process query results ###
 		    sub process_query {
 			my $query = shift;
@@ -524,12 +569,15 @@ if ($dbh) {
 			    $taxon = &process_search($hits,\%categories,$ambig_critearia);
 			    if ($categories{$taxon}) { $taxon = $categories{$taxon}; }
 			    elsif ( $taxon eq 'error' ) { print STDERR "Error parsing BLAST query $query.\n"; undef $taxon; }
+			    elsif ( $taxon eq 'unc') {}
+			    elsif (  $taxon eq 'ambi') { $taxon = 'empty'; }
 			    else { undef $taxon; }
 			}
 			elsif ($BLASTtype eq 'accno') {
 			    #print "processing $query.\n";
-			    $taxon = &process_accno_search($hits,$delimiter,$position,$BLAST_GBdatabase);
+			    $taxon = &process_accno_search($hits,$delimiter,$position,$BLAST_GBdatabase,\%index);
 			    if ( $taxon eq 'error' ) { print STDERR "Error parsing BLAST query $query.\n"; undef $taxon; }
+			    elsif (  $taxon eq 'ambi') { $taxon = 'empty'; }
 			}
 			# Insert taxon name
 			if ($taxon && $taxon ne 'unc') {
@@ -541,15 +589,15 @@ if ($dbh) {
 	    			$scaffold = $sth_protein->fetchrow_array();
     			    }
 			    if ($scaffold) {
-				if ($overwrite eq 'F' || $overwrite =~ /^C/) {
+				if ($overwrite =~/F$/ || $overwrite =~ /^C/) {
 				    $sth_check->execute($scaffold);
 				    my $temp = $sth_check->fetchrow_array();
-				    if ($overwrite =~ /^C/ && $temp && $temp ne 'empty' && $temp ne $taxon) {
-					print "BLAST based on $query say taxon should be $taxon for $scaffold.\n\tit is now $temp.\n";
-					if ($overwrite =~/T$/) { print "\tIt will be changed to $taxon.\n"; }
+				    if ($overwrite =~ /^C/ && $temp && $temp ne 'empty' && !($temp =~ /^$taxon/)) {
+					print "BLAST based on $query say taxon should be '$taxon' for $scaffold.\n\tIt is now: $temp.\n";
+					if ($overwrite =~/T$/) { print "\tIt will be changed to: $taxon.\n"; }
 				    }
 				    if (!$temp || $temp eq 'empty') { $insert = 'T'; }
-				    elsif ($overwrite =~/F$/ || $temp eq $taxon) { $insert = 'F'; }
+				    elsif ($overwrite =~ /F$/) { $insert = 'F'; }
 				}
 				#print "$query - $taxon - $scaffold - $insert\n";
 				if ($insert eq 'T') {
@@ -618,7 +666,7 @@ if ($dbh) {
 	if ($things_to_do{'pars_annotations'} eq 'protein' || $things_to_do{'pars_annotations'} eq 'CDS') {
 	    my $query;
 	    if ($count eq 'Y') { $query = "SELECT COUNT(*) FROM scaffolds INNER JOIN annotations ON scaffolds.name=annotations.seqid WHERE type='gene'$extraSQLcondition"; }
-	    else { $query = "SELECT scaffolds.name,scaffolds.sequence,annotations.start,annotations.end,annotations.strand,annotations.id FROM scaffolds INNER JOIN annotations ON scaffolds.name=annotations.seqid WHERE type='gene'$extraSQLcondition"; }
+	    else { $query = "SELECT scaffolds.name,scaffolds.sequence,annotations.start,annotations.end,annotations.strand,annotations.id,annotations.source FROM scaffolds INNER JOIN annotations ON scaffolds.name=annotations.seqid WHERE type='gene'$extraSQLcondition"; }
 	    print STDERR "Query to select genes: $query\n";
 	    my $sth = $dbh->prepare($query);
 	    $sth->execute();
@@ -627,11 +675,11 @@ if ($dbh) {
 		print "Number of protein coding genes: $n\n";
 	    }
 	    else {
-		my $sth_cds = $dbh->prepare("SELECT start,end,phase FROM annotations WHERE seqid=? AND start >= ? AND end <= ? AND type='CDS' ORDER BY start");
+		my $sth_cds = $dbh->prepare("SELECT start,end,phase FROM annotations WHERE seqid=? AND start >= ? AND end <= ? AND type='CDS' AND strand=? AND source=? ORDER BY start");
 		while (my $gene_info = $sth->fetchrow_arrayref()) {
 		    #print "$gene_info->{'name'}\n";
 		    my $seq = '';
-		    $sth_cds->execute($gene_info->[0],$gene_info->[2], $gene_info->[3]);
+		    $sth_cds->execute($gene_info->[0],$gene_info->[2], $gene_info->[3], $gene_info->[4], $gene_info->[6]);
 		    while (my ($start,$end,$phase) = $sth_cds->fetchrow_array()) {
 			$seq .= substr($gene_info->[1],$start-1,$end-$start+1);
 		    }	
@@ -765,30 +813,40 @@ print "-B/--BLASTtaxon_annotation       Give taxonomic annotation to scaffolds b
 print "                                     as next argument. Sequences in the BLAST database must start with unambigous taxon name\n";
 print "                                     matching keys in the hash \%categories (default: fungi and bact), or have an GeneBank accession\n";
 print "                                     number. The accetion number should be in a given possition (index starting with 0; default 1) in\n";
-print "                                     relation to a delimiter (| by default), e.g. position 1 in 'gb|KIL54703.1|  hypothetical...'\n";
-print "                                     delimited by |. Extra settings can be given a string as an extra argument. If the string contain:\n";
-print "                                     'annotation:acc', 'annotation:accno', 'annotation:accesion number' or similar will set the function\n";
-print "                                     to take an accession number, and check the taxonomy in GenBank (require internet connection; 'GB:'\n";
-print "                                     followed by the name of an NCBI entrez database name (default: protein), will set which database to\n";
-print "                                     look in; 'delimiter:' the next character (no whitespace in between) will be used as delimiter; 'position:'\n";
-print "                                     followed by an integer number (no whitespace in between) will be used to give the position; 'query:gene'\n";
-print "                                     will set that it is genes (or something with an annotation in the annotations table in the database)\n";
-print "                                     and not scaffolds that have been BLASTed; 'check' it will be checked if the new taxon annotation is\n";
-print "                                     different from the previous; 'overwrite' previous taxon annotation will be overwritten.\n";
+print "                                     relation to a delimiter (| by default), e.g. position 1 in 'gb|KIL54703.1|  hypothetical...'.\n";
+print "                                     Extra settings can be given a string as an extra argument. If the string contain: 'annotation:acc',\n";
+print "                                     (or longer version of accession number) it will set the function to take an accession number, and\n";
+print "                                     check the taxonomy in GenBank (require internet connection unless file in GenBank format is given);\n";
+print "                                     'GB:' followed by the name of an NCBI entrez database name (default: protein), will set which database\n";
+print "                                     to look in. If database is set to file: followed by the quoted (' or \") name of a file in full GenBank\n";
+print "                                     format, the corresponding file will be used as database; 'delimiter:' will set the delimiter to the next\n";
+print "                                     character (no whitespace in between) as delimiter; 'position:' will set the possition of the accession\n";
+print "                                     number to the following integer number (no whitespace in between); 'query:gene' will set that genes were\n";
+print "                                     used for the queries (or something else with an annotation in the annotations table in the database),\n";
+print "                                     and not scaffolds; 'check' will set that it is checked if the new taxon annotations are different from\n";
+print "                                     the previous; 'overwrite' set that previous taxon annotation will be overwritten. 'taxon:' followed by a\n";
+print "                                     quoted ('|\") string will set the \%categories hash. If the string starts with 'file:' and is followed by\n";
+print "                                     a file name, the taxon translation will be read from the file. The file shold be a tab separated text file\n";
+print "                                     where the keys are in the first column and taxon names in the second (one pair per row). Otherwise, the\n";
+print "                                     the string should be comma separated with pairs of key followed by taxon name. Examples:\n";
+print "                                         perl genomeDB.pl -db database.db -B  \"annotation:acc;query:gene;GB:'file:sequence.gp'\"\n";
+print "                                         perl genomeDB.pl -db database.db -B  \"taxa: 'fungi, Eukaryota; Fungi, bact, Prokaryote\"\n";
 print "-C/--create_database             Create the database structure.\n";
 print "-db/--database_name              Give the name of the database.\n";
 print "--get_CDS                        Print protein coding genes (annotation type gene, including at least one streach with annotation\n";
 print "                                     type CDS) as nucleotide sequences. It is possible to give extra conditions for which sequences\n";
-print "                                     to print, e.g. coverage, GC, taxon, GO, GOname or GOname_space for limiting the output based on\n";
-print "                                     median coverage, GC content, taxon of of scaffold that the protein is coded on, or GO number, GO\n";
-print "                                     number associated with certain name, or GO number belonging to a certain name space in the gene\n";
-print "                                     ontology_term. For the later two the file go.obo (http://geneontology.org/page/download-ontology)\n";
-print "                                     is needed to be in the same folder as the script is running in. The type of condition can be given\n";
-print "                                     as <, > (default), =, <=, >=, or LIKE followe by a value. If like is choosen % can be used as wildcard\n";
-print "                                     character. Examples: 'coverage 50' or 'coverage < 10'. Several constraints can be given separated\n"; 
-print "                                     by semicolon (;). The constraints will be additive (AND). It is also possible to give SQL syntax\n"; 
-print "                                     directly. It will the be treated as added to the SQL statment after an AND. If you do not want the\n";
-print "                                     sequences but only the number of genes, you can give COUNT as the first condition.\n";
+print "                                     to print, e.g. coverage, proteinCoverage, GC, proteinGC, taxon, GO, GOname or GOname_space for\n";
+print "                                     limiting the output based on median coverage, GC content, taxon of of scaffold that the protein is\n";
+print "                                     coded on, median coverage, GC content of proteins, or GO number, GO number associated with certain\n";
+print "                                     name, or GO number belonging to a certain name space in the gene ontology_term. For the later two the\n";
+print "                                     file go.obo (http://geneontology.org/page/download-ontology) is needed to be in the same folder as the\n";
+print "                                     script is running in. The type of condition can be given as <, > (default), =, <=, >=, or LIKE follow\n";
+print "                                     by a value. If like is choosen % can be used as wildcard character. Examples: 'coverage 50' or 'coverage\n";
+print "                                     < 10'. Several constraints can be given separated by semicolon (;). The constraints will be additive\n"; 
+print "                                     (AND). It is also possible to give SQL syntax directly. It will the be treated as added to the SQL statment\n"; 
+print "                                     after an AND. If you do not want the sequences but only the number of genes, you can give COUNT as the first\n";
+print "                                     condition. Example:\n";
+print "                                         perl genomeDB.pl -db database.db --get_CDS \"coverage > 30; coverage<50;GC > 0.41; GC < 0.5\"\n";
 print "--get_proteins                   Print protein coding genes (annotation type gene, including at least one streach with annotation\n";
 print "                                     type CDS) as aminoacid sequences. It is possible to give extra conditions for which sequences\n";
 print "                                     to print as for --get_CDS.\n";
@@ -821,14 +879,6 @@ sub add_to_scaffolds {
     my $taxon_ref = shift;
     my $note_ref = shift;
     my $GCcontent = &sequences::GCcontent($seq_ref);
-#    my $length = 0;
-#    for (my $i=0; $i< length $$seq_ref; ++$i) {
-#	my $char = substr($$seq_ref, $i, 1);
-#	if ($char eq 'g' || $char eq 'G' || $char eq 'c' || $char eq 'C') { ++$GCcontent; ++$length; }
-#	elsif ($char eq 'a' || $char eq 'A' || $char eq 't' || $char eq 'T') { ++$length; }
-#    }
-#    if ($length) { $GCcontent/=$length; }
-#    else { $GCcontent = 0; }
     return $dbh->do("INSERT INTO scaffolds (name, sequence, GCcontent, taxon, note) VALUES ($$name_ref, $$seq_ref, $GCcontent, $$taxon_ref, $$note_ref)");
 }
 
@@ -848,8 +898,8 @@ sub process_accno_search {
     my $delimiter = shift;
     my $position = shift;
     my $BLAST_GBdatabase = shift;
+    my $index_ref = shift;
     my $ntop_hits = 10;
-    my $FILE = shift;
     if ($hits and @{$hits}) {
 	if ($hits->[0] eq 'no hits') {
 	    #print "no hits\n";
@@ -868,6 +918,14 @@ sub process_accno_search {
 	    }
 	    my $accno_string = '';
 	    my @search;
+	    my $FILE;
+	    my $file_name;
+	    if ($BLAST_GBdatabase =~ /^file:(.+)/) {
+		$file_name = $1;
+		open ($FILE, '<', $file_name) or die "Could not open $file_name: $!.\n";
+		print "$file_name is open.\n";
+		if(tell($FILE) == -1) { print "... or is it?\n"; }
+	    }
 	    if (@accnos) {
 		foreach (@accnos) {
 		    if ($_ ne "empty") {
@@ -877,7 +935,7 @@ sub process_accno_search {
 		}
 		if (!(defined($FILE))) {
 		    # print "Getting taxon annotations: http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text\n";
-		    my $get= get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text");
+		    my $get= sequences::get_entry_from_GB($accno_string,$BLAST_GBdatabase); #get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text");
 		    if ($get && $get =~ /^Resource temporarily unavailable/) { print STDERR "NCBI eutils temporarily unavailable.\n"; }
 		    elsif ($get) { @search = split /\n/, $get; }
 		    else { print STDERR "No results for $accno_string in $BLAST_GBdatabase.\n"; }
@@ -886,56 +944,75 @@ sub process_accno_search {
 	    else { print STDERR "Could not pars any accnos.\n"; }
 	    my @taxonomy;
 	    #print "Processing annotations.\n";
-	    for (my $i = 0; $i < scalar @{$hits} && $i < $ntop_hits; ++$i) {
-	       	if ($accnos[$i] && $accnos[$i] ne 'empty') {
-		    {
-			my @temp = split /\s+/, $hits->[$i];
-			push @taxonomy, [];
-			$taxonomy[$#taxonomy]->[0] = pop @temp;
-			$taxonomy[$#taxonomy]->[1] = pop @temp;
-			# print "e-value: $taxonomy[$#taxonomy]->[0]; score: $taxonomy[$#taxonomy]->[1]\n";
-		    }
-		    my $taxon;
-		    my $right_entry = 'F';
-		    my $row;
-		    my $row_n=0;
-		    if ($FILE) { seek $FILE, 0, 0; }
-		    my $condition = 1; # Flag to stop loop
 		    ####### Sub to parse taxon from GB data ########
 		    sub taxon_from_GB {
 			my $row = shift;
 			my $accno = shift;
 			my $right_entry = shift;
 			my $taxon = shift;
-			if ($row =~ /^ACCESSION\s+(\w+)/) {
+			if ($$row =~ /^ACCESSION\s+(\w+)/) {
+			    #print $$row, "\n";
 			    my $entry = $1;
-			    if ($accno =~ /$entry/) { $right_entry = 'T'; } #print "$accno match $entry.\n"; }
-			    else { $right_entry = 'F'; }#print "$accno does not match $entry.\n";}
+			    if (!$accno) { print "No accno\n"; }
+			    if ($accno =~ /$entry/) { $right_entry = 'T'; print "Found it.\n";} 
+			    else { $right_entry = 'F'; }
 			}
-		     	elsif ($right_entry eq 'T' && $row =~ /\s*ORGANISM\s+(.+)/) { $$taxon = '';}# print "Parsing taxon:\n";}
+		     	elsif ($right_entry eq 'T' && $$row =~ /\s*ORGANISM\s+(.+)/) { $$taxon = '';}
 		 	elsif (defined($$taxon) && $right_entry eq 'T') {
 	     		    s/\s+//g;
 	 		    $$taxon .= $_;
-			    #print "$$taxon\n";
      			    if (/\.$/) { $right_entry = 'L'; }
  			}
 			return $right_entry;
 		    }
 		    #################################################
+	    for (my $i = 0; $i < scalar @{$hits} && $i < $ntop_hits; ++$i) {
+	       	if ($accnos[$i] && $accnos[$i] ne 'empty') {
+		    #print "Made it here.\n";
+		    {
+			my @temp = split /\s+/, $hits->[$i];
+			push @taxonomy, [];
+			$taxonomy[$#taxonomy]->[0] = pop @temp;
+			$taxonomy[$#taxonomy]->[1] = pop @temp;
+			#print "e-value: $taxonomy[$#taxonomy]->[0]; score: $taxonomy[$#taxonomy]->[1]\n";
+		    }
+		    my $taxon;
+		    my $right_entry = 'F';
+		    if ($FILE) {
+			if(tell($FILE) == -1) {
+			    open ($FILE, '<', $file_name) or die "Could not open $file_name: $!.\n";
+			    #print "... or is it?\n";
+			}
+			if ($index_ref) {
+			    #print "Looking in index.\n";
+			    my $temp = $accnos[$i];
+			    $temp =~ s/\.[0-9]+$//;
+			    if ($index_ref->{$temp}) {
+				seek $FILE,$index_ref->{$temp}-1,0;
+				#print "Found $temp at $index_ref->{$temp}.\n";
+			    }
+			    else { seek $FILE,-1,2; }
+			}
+			else { seek $FILE, 0, 0; }
+		    }
+		    my $condition = 1; # Flag to stop loop
 		    if (defined($FILE)) {
+			#print "looking for taxonomy.\n";
+			my $j=0;
 			while (<$FILE>) {
-			    $right_entry = &taxon_from_GB($_,$accnos[$i],$right_entry,\$taxon);
+			    #print ++$j, "\n";
+			    $right_entry = &taxon_from_GB(\$_,$accnos[$i],$right_entry,\$taxon);
 			    if ( $right_entry eq 'L' ) { last; }
 			}
 		    }
 		    else {
 			foreach (@search) {
-			    $right_entry = &taxon_from_GB($_,$accnos[$i],$right_entry,\$taxon);
+			    $right_entry = &taxon_from_GB(\$_,$accnos[$i],$right_entry,\$taxon);
 			    if ( $right_entry eq 'L' ) { last; }
 			}
 		    }
 		    if ($taxon) { push @{$taxonomy[$#taxonomy]}, split /\s*;\s*/, $taxon }
-		    else { print STDERR "Could not find taxon annotation for $accnos[$i].\n"; }
+		    #else { print STDERR "Could not find taxon annotation for $accnos[$i].\n"; }
 		}
 		else { print STDERR "GB no accession number found for:\n\t $hits->[$i].\n"; }
 	    }
@@ -954,8 +1031,6 @@ sub process_accno_search {
 		    for ( my $i=0; $i < $cut_off-1; ++$i) {
 			if ($pos < scalar @{$taxonomy[$i]} || $pos < scalar @{$taxonomy[$i+1]}) {
 			    $check = 'T';
-			    #if ($taxonomy[$i]->[$pos]) { print "$i - $taxonomy[$i]->[$pos]\n"; }
-			    #if ($taxonomy[$i+1]->[$pos]) { print "$i+1 - $taxonomy[$i+1]->[$pos]\n"; }
 			    if ($taxonomy[$i]->[$pos] && $taxonomy[$i+1]->[$pos] && $taxonomy[$i]->[$pos] ne $taxonomy[$i+1]->[$pos]) { $done = 'T'; last}
 			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos];}# print "$pos - $taxon\n" }
 			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos];}# print "$pos - $taxon\n" }
@@ -994,30 +1069,51 @@ sub process_accno_search {
 sub process_search {
     my $hits = shift;
     my $categories = shift;
-    my $critearia = shift;
-
+    my $criteria = shift;
+    my $ntop_hits = 10;
     if ($hits and @{$hits}) {
         if (${$hits}[0] eq 'no hits') {
             return 'unc';
         }
         else {
             my $organism = 'unc';
+	    my $sum_score=0;
+	    for (my $i = 0; $i < $ntop_hits && $i < scalar @{$hits}; ++$i) {
+		my @temp = split /\s+/, $hits->[$i];
+		my $evalue = pop @temp;
+		my $score = pop @temp;
+		if ($score && $score > 0) { $sum_score += $score; }
+	    }
+	    my $cut_off = $sum_score/2;
+	    $sum_score=0;
             for (my $i = 0; $i < scalar @{$hits}; ++$i) {
                 if (!$hits->[$i]) { next; }
                 my $flag = 'n';
                 foreach my $type (keys %{$categories}) {
                     if ($hits->[$i] =~ /^$type/) {
                         $flag = 'y';
-                        if ($organism eq 'unc') { $organism = $type; }
-                        else {
-                            if ($organism ne $type) {
-                                $organism = &evaluate_ambiguity($organism,$hits,$i,$critearia);
-                            }
-                            if ($organism eq 'ambi') { last; }
-                        }
-                    }
-                }
-                if ($flag eq 'n') { print STDERR "Do not recognize $hits->[$i] --- $i --- ", scalar @{$hits}, " --- ", keys %{$categories}, "\n"; }
+			if ($criteria == 1) {
+			    if ($organism eq 'unc') { $organism = $type; }
+			    elsif ($organism ne $type) { $organism = 'ambi'; }
+			}
+			elsif ($criteria == 2) {
+			    if ($organism eq 'unc') { $organism = $type; }
+			}
+			elsif ($criteria == 3) { 
+			    if ($i < $ntop_hits && $sum_score < $cut_off) {
+				if ($organism eq 'unc') { $organism = $type; }
+				elsif ($organism ne $type) { $organism = 'ambi'; }
+				my @temp = split /\s+/, $hits->[$i];
+				my $evalue = pop @temp;
+				$sum_score += pop @temp;
+			    }
+			}
+                         #       $organism = &evaluate_ambiguity($organism,$hits,$i,$critearia);
+			last;
+		    }
+		}
+		if ($organism eq 'ambi') { last; }
+                if ($flag eq 'n') { print STDERR "Do not recognize $hits->[$i] --- $i --- ", scalar @{$hits}, " --- ", join (', ', keys %{$categories}), "\n"; }
             }
             return $organism;
         }
@@ -1030,12 +1126,16 @@ sub evaluate_ambiguity {
     my $hits = shift; # A reference to an array of blast hits
     my $position = shift; # The index of the present hit being evaluated
     my $criterion = shift; # Which of the below criterions to use
+    my $ntop_hits = shift;
     if ($criterion == 1) {
         return 'ambi';
     }
     elsif ($criterion == 2) {
         if ($position > 0) { return $type; }
         else { return 'ambi'; }
+    }
+    elsif ($criterion == 3) {
+
     }
     else { return 'ambi'; }
 }
@@ -1047,7 +1147,8 @@ sub pars_extraSQLcondition {
     foreach (@string) {
 	#s/('|")/\\$1/g;
 	if ($return_string) { $return_string .= " AND "; }
-	if (/(coverage|GC|taxon|GOname_space|GOname|GO)(:| )*(>=|<=|==|!=|<|>|=|LIKE|NOT LIKE)*\s*(.+)/i) {
+	if ( s/^SQL://i) { $return_string .= $_; }
+	elsif (/(proteincoverage|coverage|proteinGC|GC|taxon|GOname_space|GOname|GO)(:| )*(>=|<=|==|!=|<|>|=|LIKE|NOT LIKE)*\s*(.+)/i) {
 	    #print "$_\t$1 $3 $4\n";
 	    my $field = uc($1);
 	    my $sign;
@@ -1058,10 +1159,11 @@ sub pars_extraSQLcondition {
 	    #print "$field $sign $value\n";
 	    if ($field eq 'COVERAGE') {	$return_string .= "scaffolds.coverage_median "; }
 	    elsif ($field eq 'GC') { $return_string .= "scaffolds.GCcontent "; }
+	    elsif ($field eq 'PROTEINCOVERAGE') { $return_string .= "annotations.coverage_median "; }
+	    elsif ($field eq 'PROTEINGC') { $return_string .= "annotations.GCcontent "; }
 	    elsif ($field eq 'TAXON') { $return_string .= "scaffolds.taxon "; }
 	    elsif ($field eq 'GO') { $return_string .= "annotations.ontology_term LIKE \"\%GO:$value\%\""; next}
 	    elsif ($field eq 'GONAME' || $field eq 'GONAME_SPACE') {
-		
 		if ($return_string) { $return_string = "($return_string"; }
 		open GOTERMS, "<go.obo" or die "Need the file go.obo (http://geneontology.org/page/download-ontology) to translate GO names or name spaces into GO numbers.\n";
 		my $present_number = '';
@@ -1163,7 +1265,7 @@ sub pars_samtool_view_row_to_hash {
     else { ++$hash_ref->{$columns[0]}->[0]->{'rev'}; }
     if ($columns[6] ne '=') {
 	if (!$hash_ref->{$columns[0]}->[0]->{'mate_scaf'}) { $hash_ref->{$columns[0]}->[0]->{'mate_scaf'} = []; }
-	push $hash_ref->{$columns[0]}->[0]->{'mate_scaf'}, $columns[6];
+	push @{$hash_ref->{$columns[0]}->[0]->{'mate_scaf'}}, $columns[6];
     }
     push @{$hash_ref->{$columns[0]}}, "$columns[9]\n+\n$columns[10]";
 }

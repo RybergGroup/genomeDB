@@ -1,5 +1,6 @@
 package sequences;
 use strict;
+use LWP::Simple;
 
 my %genecode = ( standard => {'GCT' => 'A', 'GCC' => 'A', 'GCA' => 'A', 'GCG'=>'A',
 		'TTA' => 'L', 'TTG' => 'L', 'CTT' => 'L', 'CTC' => 'L', 'CTA' => 'L', 'CTG'=> 'L',
@@ -88,6 +89,13 @@ sub GCcontent {
 	#print "$$seq_ref - $GCcontent - $length\n";
     }
     return $GCcontent;
+}
+
+sub get_entry_from_GB {
+    my $database = pop;
+    my $accnos = shift;
+    foreach (@_) { $accnos .= ",$_"; }
+    return get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&id=$accnos&rettype=gb&retmode=text");
 }
 
 1;
