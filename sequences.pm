@@ -92,9 +92,10 @@ sub GCcontent {
 }
 
 sub get_entry_from_GB {
-    my $database = pop;
-    my $accnos = shift;
+    my $database = pop; # last argument is database name
+    my $accnos = shift; # first argument is comma separated string of accnos
     foreach (@_) { $accnos .= ",$_"; }
+    #print "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&id=$accnos&rettype=gb&retmode=text\n"; # for debugging
     return get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&id=$accnos&rettype=gb&retmode=text");
 }
 
