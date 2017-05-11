@@ -96,7 +96,7 @@ sub get_entry_from_GB {
     my $accnos = shift; # first argument is comma separated string of accnos
     foreach (@_) { $accnos .= ",$_"; }
     #print "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&id=$accnos&rettype=gb&retmode=text\n"; # for debugging
-    return get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&id=$accnos&rettype=gb&retmode=text");
+    return get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$database&amp;id=$accnos&amp;rettype=gb&amp;retmode=text");
 }
 
 1;

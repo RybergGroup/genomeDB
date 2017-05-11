@@ -6,6 +6,8 @@ use lib "$FindBin::Bin";
 use DBI;
 #use Bio::DB::Sam;
 use LWP::Simple;
+use Text::Wrap;
+$Text::Wrap::columns = 80;
 use sequences;
 
 ####################################################################
@@ -32,8 +34,9 @@ my $overwrite = 'CF';
 my $delimiter = '\|';
 my $position = 1;
 my $BLAST_GBdatabase = 'protein';
+my $e_cut_off;
 my $bam_for_annotations = 'F';
-
+my $SNP_for_annotations = 'F';
 ###############################################
 ### Parsing arguments                       ###
 ###############################################
@@ -100,6 +103,16 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
 	    if ($ARGV[$i] =~ /anno/i) { $bam_for_annotations = 'T'; }
 	}
     }
+    elsif ($ARGV[$i] eq '-v' || $ARGV[$i] eq '--read_vcf') {
+        $things_to_do{"readVCF"}='T';
+        if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
+            $things_to_do{"readVCF"}=$ARGV[++$i];
+        }
+        if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
+            ++$i;
+            if ($ARGV[$i] =~ /anno/i) { $SNP_for_annotations = 'T'; }
+        }
+    }
     elsif ($ARGV[$i] eq '--N50') {
 	$things_to_do{"N50"} = 'all';
 	if (defined($ARGV[$i+1]) && !($ARGV[$i+1] =~ /^-/)) {
@@ -155,6 +168,7 @@ for (my $i=0; $i < scalar @ARGV; ++$i) {
 		if (!$BLAST_GBdatabase =~ /file:/i) { $BLAST_GBdatabase = lc($BLAST_GBdatabase); }
 	    }
 	    if ( $ARGV[$i] =~ /annotation:acc/i ) { $BLASTtype = 'accno'; }
+	    if ( $ARGV[$i] =~ /ecutoff:([0-9e.-]+)/i || $ARGV[$i] =~ /e-cutoff:([0-9e.-]+)/i || $ARGV[$i] =~ /e_cut_off:([0-9e.-]+)/i || $ARGV[$i] =~ /e-cut_off:([0-9e.-]+)/i) { $e_cut_off = $1; }
 	    if ( $ARGV[$i] =~ /delimiter:(.)/i) {
 		$delimiter = $1;
 		if ($delimiter eq '|' || $delimiter eq '.' || $delimiter eq '(' || $delimiter eq ')' || $delimiter eq '[' || $delimiter eq ']' || $delimiter eq '{' || $delimiter eq '}' || $delimiter eq '\\'){
@@ -549,10 +563,130 @@ if ($dbh) {
 	}
 	else { die "Need a name of the bam file.\n"; }
     }
+########################################################################################
+    if ($things_to_do{'readVCF'}) {
+	print "Will read and summarize SNPs from $things_to_do{'readVCF'}.\n";
+	if (-e $things_to_do{'readVCF'}) {
+	    open VCF, '<', $things_to_do{'readVCF'} or die "Could not open $things_to_do{'readVCF'}.\n";
+	    my $sth_insert = $dbh->prepare("UPDATE scaffolds SET nSNP=?, npolySNP=?, percdiSNP40_60=?, medianSNPdiversity=? WHERE name=?");
+	    my $sth_annotations;
+    	    my $sth_insert_annotations;
+	    if ($SNP_for_annotations eq 'T') {
+		$sth_annotations = $dbh->prepare("SELECT start,end,id FROM annotations WHERE seqid=?");
+		$sth_insert_annotations = $dbh->prepare("UPDATE annotations SET nSNP=? WHERE seqid=? AND id=?");
+	    }
+	    my $begin_sth = $dbh->prepare("BEGIN");
+	    $begin_sth->execute();
+	    my $commit_sth = $dbh->prepare("COMMIT");
+	    my $scaffold;
+	    my $n_scaffolds=0;
+	    my @SNPs;
+	    my $added_stats = 0;
+	    my $protein_annotations = 0;
+	    print "Processing SNPs.\n";
+	    $last_time = time;
+##############
+##############
+		sub handleSNPs {
+		    if (@SNPs && $SNP_for_annotations eq 'T') {
+			$sth_annotations->execute($scaffold);
+			my $n=0;
+			while (my ($start,$end,$id) = $sth_annotations->fetchrow_array()) {
+			    my $nSNPs = 0;
+			    foreach (@SNPs) { if ($_->[0] >= $start && $_->[0] <= $end) { ++$nSNPs } }
+			    if ($sth_insert_annotations->execute($nSNPs, $scaffold, $id)) { ++$n; }
+			}
+			$protein_annotations += $n;
+			if ($n > 500) {
+			    $commit_sth->execute();
+			    $begin_sth->execute();
+			}
+		    }
+		    if (@SNPs) {
+			my $n_pollySNP = 0;
+			my $ndiSNP40_50 = 0;
+		       	my @SNP_div;
+			foreach (@SNPs) {
+			    if ($_->[1] && scalar @{$_->[1]} > 1) {
+				++$n_pollySNP;
+				my $sum=0;
+				foreach (@{$_->[1]}) { $sum += $_**2; }
+				push @SNP_div, 1/$sum;
+			    }
+			    else {
+				if ($_->[1] && $_->[1]->[0] > 0.4 && $_->[1]->[0] < 0.6) { ++$ndiSNP40_50; }
+			    }
+			}
+			my $median_SNP_div = 0;
+			if (@SNP_div) {
+			    @SNP_div = sort @SNP_div;
+			    if (scalar @SNP_div < 2) {
+				$median_SNP_div = $SNP_div[0];
+			    }
+			    elsif (scalar @SNP_div % 2) {
+				$median_SNP_div = $SNP_div[scalar(@SNP_div)/2];
+			    }
+			    else { $median_SNP_div = ($SNP_div[(scalar(@SNP_div)/2)-1] + $SNP_div[scalar(@SNP_div)/2]) / 2; }
+			}
+			if ($sth_insert->execute( scalar @SNPs, $n_pollySNP, $ndiSNP40_50/scalar @SNPs, $median_SNP_div, $scaffold)) {
+			    ++$added_stats;
+			    if (!($added_stats % 500)) {
+				print "Added $added_stats annotations to scaffolds ";
+				if ($protein_annotations) { print " and $protein_annotations to geneome annotations "; }
+				print "(",time-$last_time,"s).\n";
+				$last_time = time;
+				$commit_sth->execute();
+				$begin_sth->execute();
+			    }
+			}
+			else {
+			    print STDERR "Could not add stats for $scaffold.\n";
+			}
+		    }
+		    else { print "No SNPs for $scaffold.\n"; }
+		}
+####################################
+####################################
+	    while (my $row = <VCF>) {
+		if ($row =~ /^#/) { next; }
+		my @columns = split /\t/, $row;
+		if (defined $scaffold && $columns[0] ne $scaffold) {
+		    &handleSNPs();
+		    undef @SNPs;
+		    $scaffold = $columns[0];
+		}
+		elsif (!defined($scaffold)) { $scaffold = $columns[0]; }
+		push @SNPs,[];
+		$SNPs[$#SNPs]->[0] = $columns[1];
+		$SNPs[$#SNPs]->[1] = [];
+		my %info = split /=|;/, $columns[7];
+		if (defined $info{AF}) {
+		    @{$SNPs[$#SNPs]->[1]} = split /,/,$info{AF};
+		}
+		elsif (defined $info{FR}) {
+                    @{$SNPs[$#SNPs]->[1]} = split /,/,$info{FR};
+                }
+		else { print STDERR "No alternative base frequencies for $columns[0], pos $SNPs[$#SNPs]->[0].\n"; }
+##############################################
+	    }
+	    if (defined $scaffold) { &handleSNPs(); }
+	    $commit_sth->execute();
+    	    $commit_sth->finish();
+	    $begin_sth->finish();
+	    if ($bam_for_annotations eq 'T') { $sth_annotations->finish(); $sth_insert_annotations->finish(); }
+	    $sth_insert->finish();
+	    #$sth->finish();
+	    print "Added stats to $added_stats scaffolds (",time-$last_time,"s).\n";
+	    $last_time = time;
+	}
+	else { die "Could not find VCF file name.\n"; }
+############
+############
+    }
 ######################################################################################
     if ($things_to_do{'pars_blast'}) {
 	if ($things_to_do{'pars_blast'} ne 'T') {
-	    print "Will read BLAST results from $things_to_do{'pars_blast'} to uppdate taxon annotation of scaffolds.";
+	    print "Will read BLAST results from $things_to_do{'pars_blast'} to uppdate taxon annotation of scaffolds.\n";
 	    if ($BLASTtype eq 'taxonomy') {
 		print " Assuming first word of each match is a taxon name.";
 		foreach(keys %categories) { print " $_ will be interpreted as $categories{$_}."; }
@@ -567,6 +701,9 @@ if ($dbh) {
 	    my $query;
 	    my @hits;
 	    my $added_taxa=0;
+	    my $changed_annotations=0;
+	    my $taxa_without_hit=0;
+	    my $taxa_with_unsignificant_hits=0;
 	    open my $BLAST, "<$things_to_do{'pars_blast'}" or die "Could not open $things_to_do{'pars_blast'}: $!.\n";
 	    my $sth = $dbh->prepare("UPDATE scaffolds SET taxon=? WHERE name=?");
 	    my $sth_protein;
@@ -576,9 +713,17 @@ if ($dbh) {
     	    $begin_sth->execute();
 	    my $commit_sth = $dbh->prepare("COMMIT");
 	    my %index;
-	    if ($BLAST_GBdatabase =~ /^file:download((:)(\w+))?$/ && $BLASTtype eq 'accno') {
+	    if (($BLAST_GBdatabase =~ /^file:download(:)?/ || $BLAST_GBdatabase =~ /^file:complement:[^\:]+/) && $BLASTtype eq 'accno') {
 		my $NCBIdatabase = 'protein';
-		if ($3) { $NCBIdatabase = $3; }
+		my $filename;
+		if ($BLAST_GBdatabase =~ /^file:download((:)(\w+))?$/) { if ($3) { $NCBIdatabase = $3; } }
+		elsif ($BLAST_GBdatabase =~ /^file:complement:([^\:]+)((:)(\w+))?$/) {
+		    if ($1) { $filename = $1; }
+		    else { die "Could not pars file name from '$BLAST_GBdatabase'.\n"; }
+		    if ($4) { $NCBIdatabase = $4; }
+		}
+		else { die "Do not recognize option '$BLAST_GBdatabase'.\n"; }
+		print STDERR "Will use NCBI database $NCBIdatabase.\n";
 		my %accnos;
 		while (<$BLAST>) {
 		    if (/Sequences producing significant alignments:/) { # Reached list of hits
@@ -587,7 +732,11 @@ if ($dbh) {
 			    elsif (/^\s*(.+)/) {
 				my $temp = $1;
 				my @annotations = split /$delimiter/, $temp;
-				if ($annotations[$position]) { ++$accnos{$annotations[$position]}; }
+				if ($annotations[$position]) {
+				    $annotations[$position] =~ s/\.[0-9]+$//;
+				    ++$accnos{$annotations[$position]};
+				    #print $annotations[$position], "\n";
+				}
 			    }
 			}
 		    }
@@ -595,19 +744,33 @@ if ($dbh) {
 		close $BLAST;
 		open $BLAST, "<$things_to_do{'pars_blast'}" or die "Could not re-open $things_to_do{'pars_blast'}: $!.\n";
 		print STDERR "Found ", scalar keys %accnos, " accession numbers. Will try to download GenBank annotations from NCBI database $NCBIdatabase.\n";
+		if ($filename) {
+		    print STDERR "Checking what records are already present in $filename.\n";
+		    open INPUT, '<', $filename or die "Could not open $filename to see what accnos are present: $!.\n";
+		    while (my $row = <INPUT>) {
+			if ($row =~ /^ACCESSION\s+(\w+)/) { delete $accnos{$1}; }
+		    }
+		    print STDERR "\t$filename needs to be complemented by ", scalar keys %accnos, " records.\n";
+		}
 		my $i=1;
 		my $query;
-		my $filename = "genomeDB.genbankfile.gb";
-		while (-e $filename) {
-		    print STDERR "$filename exist, ";
-		    if ($filename =~ /gb$/) { $filename = "genomeDB.genbankfile.gb_1"; }
-		    elsif ($filename =~ s/gb_(\d+)$/gb_/) { my $number=$1; ++$number; $filename .= "$number"; }
-		    else { die "ERROR in assigning file name ($filename) to GenBank annotation file.\n"; }
-		    print STDERR "will try $filename.\n";
+		my $GBFILE;
+		if (!$filename) {
+		    $filename = "genomeDB.genbankfile.gb";
+		    while (-e $filename) {
+			print STDERR "$filename exist, ";
+			if ($filename =~ /gb$/) { $filename = "genomeDB.genbankfile.gb_1"; }
+			elsif ($filename =~ s/gb_(\d+)$/gb_/) { my $number=$1; ++$number; $filename .= "$number"; }
+			else { die "ERROR in assigning file name ($filename) to GenBank annotation file.\n"; }
+			print STDERR "will try $filename.\n";
+		    }
+		    print STDERR "Will download GenBank annotations to $filename.\n";
+		    open $GBFILE,'>', $filename || die "Could not open $filename: $!.\n";
 		}
-		print STDERR "Will download GenBank annotations to $filename.\n";
+		else {open $GBFILE,'>>', $filename || die "Could not open $filename: $!.\n"; }
 		$BLAST_GBdatabase = "file:$filename";
-		open GBFILE,'>', $filename || die "Could not open $filename: $!.\n";
+		my $no_queries = 0;
+		my $time = time;
 		foreach my $accno (keys %accnos) {
 		    if ($query) {  $query .= ",$accno"; }
 		    else { $query = $accno; }
@@ -616,22 +779,25 @@ if ($dbh) {
 			my $printed = 1;
 			while ($printed) {
 			    #print $printed, "\n";
-			    if ($printed > 10) { last; print STDERR "Could not download GenBank annotations for $query.\n"; }
+			    if ($printed > 10) { print STDERR "Could not download GenBank annotations for $query.\n"; last; }
+			    # print "Getting entry from NCBI: ", time,"\n";
 			    my $get= sequences::get_entry_from_GB($query,$NCBIdatabase);
-			    if ($get && $get =~ /^Resource temporarily unavailable/) { print STDERR "NCBI eutils temporarily unavailable, waiting 3min.\n"; ++$printed; sleep(180);}
+			    ++$no_queries;
+			    if ($get && $get =~ /^Resource temporarily unavailable/) { print STDERR "NCBI eutils temporarily unavailable, waiting 30 seconds...\n"; ++$printed; sleep(30);}
 			    if ($get && $get =~ /^Database: .+ - is not supported/) { die "The database $NCBIdatabase is not supported by NCBI.\n"; }
 			    elsif ($get) {
 				$printed = 0;
-				print GBFILE $get;
+				print $GBFILE $get;
 				print STDERR "Processed $i accession numbers.\n";
 			    }
-			    else { print STDERR "No results from NCBI eutils, waiting 3min..\n"; ++$printed; sleep(180);}
+			    else { print STDERR "No results from NCBI eutils, waiting 30 seconds...\n"; ++$printed; sleep(30);}
 			}
 			undef $query;
 		    }
 		    ++$i;
 		}
-		close GBFILE;
+		close $GBFILE;
+		print "Made $no_queries queries from GenBank in ", time - $time, " seconds.\n";
 	    }
 	    if ($BLAST_GBdatabase =~ /file:(.+)/i) {
 		open (FILE, '<', $1) || die "Could not open $1: $!.\n";
@@ -641,7 +807,7 @@ if ($dbh) {
 		    if (/^LOCUS/) { $pos = tell(FILE); }
 		    if ($pos && /^ACCESSION\s+(\w+)/) { $index{$1} = $pos; $pos = 0;}
 		}
-		print "Done. Proceeding.\n";
+		print "Done. Indexed ", scalar keys %index, " sequences. Proceeding.\n";
 		close FILE;
 	    }
 	    ### sub to process query results ###
@@ -666,6 +832,7 @@ if ($dbh) {
 			}
 			# Insert taxon name
 			if ($taxon && $taxon ne 'unc') {
+			    if ($taxon eq 'empty') { print "Taxon assignment ambigious.\n"; }
 			    #print "$query - $taxon\n";
 			    my $insert = 'T';
 			    my $scaffold = $query;
@@ -679,8 +846,15 @@ if ($dbh) {
 				    my $temp = $sth_check->fetchrow_array();
 				    if ($overwrite =~ /^C/ && $temp && $temp ne 'empty' && !($temp =~ /^$taxon/)) {
 					print "BLAST based on $query say taxon should be '$taxon' for $scaffold.\n\tIt is now: $temp.\n";
-					if ($overwrite =~/T$/) { print "\tIt will be changed to: $taxon.\n"; }
+					if ($overwrite =~/T$/) { print "\tIt will be changed to: $taxon.\n"; ++$changed_annotations}
 				    }
+				    #if ($overwrite =~/T$/) {
+					#if ($temp && $temp ne 'empty') {
+					#    $insert = 'F';
+					#    print "\nWill keep annotation '$temp' for $scaffold, and not set it to 'empty'.\n";
+					#}
+					#else { print "\tIt will be changed to: $taxon.\n"; }
+				    #}
 				    if (!$temp || $temp eq 'empty') { $insert = 'T'; }
 				    elsif ($overwrite =~ /F$/) { $insert = 'F'; }
 				}
@@ -718,12 +892,22 @@ if ($dbh) {
 		    while(<$BLAST>) {
 			if (/^>/ || /^ALIGNMENTS/) { last; } # hit first alignment
 			elsif (/^\s*(.+)/) {
-			    push @hits, $1;
+			    my $hit = $1;
+			    if (defined($e_cut_off)) {
+				
+				if ($hit =~ /([0-9\.-]+)\s*$/) {
+				    if ($1 > $e_cut_off) { last; }
+				}
+				else { print STDERR "Could not find e-value for '", $hit, "'.\n"; }
+			    }
+			    push @hits, $hit;
 			}
 		    }
+		    if (!@hits) { $hits[0] = 'no hits'; ++$taxa_with_unsignificant_hits; }
 		}
 		elsif (/\*{5} No hits found \*{5}/) { # No hits
 		    $hits[0] = 'no hits';
+		    ++$taxa_without_hit;
 		}
 	    }
 	    if (@hits) { 
@@ -735,7 +919,11 @@ if ($dbh) {
 	    $sth->finish();
 	    $sth_check->finish();
 	    if ($protein_query eq 'T') { $sth_protein->finish(); }
-	    print "Added $added_taxa annotations (",time-$last_time,"s).\n";
+	    my $output_string = "Added $added_taxa annotations ";
+	    if ($changed_annotations) { $output_string .= "of which $changed_annotations had previous taxonomic annotation "; }
+	    $output_string .= "(" . (time-$last_time) . "s). ";
+	    $output_string .= "$taxa_without_hit queries did not have any hit, and $taxa_with_unsignificant_hits did not have any hits with e-value below the cut off.\n";
+	    print wrap('','',$output_string);
 	}
 	else { die "Need name of blast output file.\n"; }
     }
@@ -899,68 +1087,72 @@ sub help {
 print "Genome database handler.\nmartin.ryberg\@ebc.uu.se\n\n";
 print "Arguments\n";
 print "-B/--BLASTtaxon_annotation       Give taxonomic annotation to scaffolds based on blast file (default BLASTN 2.2.28+ output) given\n";
-print "                                     as next argument. Sequences in the BLAST database must start with unambigous taxon name\n";
-print "                                     matching keys in the hash \%categories (default: fungi and bact), or have easily parsable GeneBank accession\n";
-print "                                     numbers. The accetion number should be in a given possition (index starting with 0; default 1) in\n";
-print "                                     relation to a delimiter (| by default), e.g. position 1 in 'gb|KIL54703.1|  hypothetical...'.\n";
-print "                                     Extra settings can be given as an extra argument. If the string contain: 'annotation:acc',\n";
-print "                                     (or longer version of accession number) it will set the function to take an accession number, and\n";
-print "                                     check the taxonomy in GenBank (require internet connection unless file in GenBank format is given);\n";
-print "                                     'GB:' followed by the quoted ('|\") name of an NCBI entrez database name (eg. GB:'nucleotide'; default: protein),\n";
-print "                                     will set which database to look in. If database is set to file: followed by the name of a file in full GenBank\n";
-print "                                     format, the corresponding file will be used as database (eg. GB:'file:myGBannotations.txt'). By giving\n";
-print "                                     'file:download' all accession numbers for matching sequences in the blast file will be downloaded to a\n";
-print "                                     file before the annotation starts. If this option is used the NCBI database can be given after another\n";
-print "                                     semicolon (eg. 'file:download:nucleotide'). 'delimiter:' will set the delimiter to the next\n";
-print "                                     character (no whitespace in between) as delimiter; 'position:' will set the possition of the accession\n";
-print "                                     number to the following integer number (no whitespace in between); 'query:gene' will set that genes were\n";
-print "                                     used for the queries (or something else with an annotation in the annotations table in the database),\n";
-print "                                     and not scaffolds; 'check' will set that it is checked if the new taxon annotations are different from\n";
-print "                                     the previous; 'overwrite' set that previous taxon annotation will be overwritten. 'taxon:' followed by a\n";
-print "                                     quoted ('|\") string will set the \%categories hash. If the string starts with 'file:' and is followed by\n";
-print "                                     a file name, the taxon translation will be read from the file. The file shold be a tab separated text file\n";
-print "                                     where the keys are in the first column and taxon names in the second (one pair per row). Otherwise, the\n";
-print "                                     the string should be comma separated with pairs of key followed by taxon name. Examples:\n";
-print "                                         perl genomeDB.pl -db database.db -B  blast.file \"annotation:acc;query:gene;GB:'file:sequence.gp'\"\n";
-print "                                         perl genomeDB.pl -db database.db -B  blast.file \"taxa: 'fungi, Eukaryota; Fungi, bact, Prokaryote\"\n";
+print "                                 as next argument. Sequences in the BLAST database must start with unambigous taxon name\n";
+print "                                 matching keys in the hash \%categories (default: fungi and bact), or have easily parsable GeneBank accession\n";
+print "                                 numbers. The accetion number should be in a given possition (index starting with 0; default 1) in\n";
+print "                                 relation to a delimiter (| by default), e.g. position 1 in 'gb|KIL54703.1|  hypothetical...'.\n";
+print "                                 Extra settings can be given as an extra argument. If the string contain: 'annotation:acc',\n";
+print "                                 (or longer version of accession number) it will set the function to take an accession number, and\n";
+print "                                 check the taxonomy in GenBank (require internet connection unless file in GenBank format is given);\n";
+print "                                 'GB:' followed by the quoted ('|\") name of an NCBI entrez database name (eg. GB:'nucleotide'; default: protein),\n";
+print "                                 will set which database to look in. If database is set to file: followed by the name of a file in full GenBank\n";
+print "                                 format, the corresponding file will be used as database (eg. GB:'file:myGBannotations.txt'). By giving\n";
+print "                                 'file:download' all accession numbers for matching sequences in the blast file will be downloaded to a\n";
+print "                                 file before the annotation starts. If 'file:complement' is given followed by another colon (:) and the name of a\n";
+print "                                 file in genbank format, accession numbers not in the given file will be downloaded and added to the file. If any\n";
+print "                                 of these two latter option are used the NCBI database can be given after another colon (eg.\n";
+print "                                 'file:download:nucleotide'). 'delimiter:' will set the delimiter to the next character (no whitespace in between)\n";
+print "                                 as delimiter; 'position:' will set the possition of the accession number to the following integer number (no\n";
+print "                                 whitespace in between); 'query:gene' will set that genes were used for the queries (or something else with an\n";
+print "                                 annotation in the annotations table in the database), and not scaffolds; 'e-cut_off' followed by a value will set\n";
+print "                                 the maximum e-value to consider as a significant match (ignoring other matches). 'check' will set that it is checked if\n";
+print "                                 the new taxon annotations are different from the previous; 'overwrite' set that previous taxon annotation will be\n";
+print "                                 overwritten. 'taxon:' followed by a quoted ('|\") string will set the \%categories hash. If the string starts with\n";
+print "                                 'file:' and is followed by  a file name, the taxon translation will be read from the file. The file shold be a tab\n";
+print "                                 separated text file where the keys are in the first column and taxon names in the second (one pair per row).\n";
+print "                                 Otherwise the string should be comma separated with pairs of key followed by taxon name. Examples:\n";
+print "                                     perl genomeDB.pl -db database.db -B  blast.file \"annotation:acc;query:gene;GB:'file:sequence.gp'\"\n";
+print "                                     perl genomeDB.pl -db database.db -B  blast.file \"taxa: 'fungi, Eukaryota; Fungi, bact, Prokaryote\"\n";
 print "-C/--create_database             Create the database structure.\n";
 print "-db/--database_name              Give the name of the database.\n";
 print "--get_CDS                        Print protein coding genes (annotation type gene, including at least one streach with annotation\n";
-print "                                     type CDS) as nucleotide sequences. It is possible to give extra conditions for which sequences\n";
-print "                                     to print, e.g. coverage, proteinCoverage, GC, proteinGC, taxon, GO, GOname or GOname_space for\n";
-print "                                     limiting the output based on median coverage, GC content, taxon of of scaffold that the protein is\n";
-print "                                     coded on, median coverage, GC content of proteins, or GO number, GO number associated with certain\n";
-print "                                     name, or GO number belonging to a certain name space in the gene ontology_term. For the later two the\n";
-print "                                     file go.obo (http://geneontology.org/page/download-ontology) is needed to be in the same folder as the\n";
-print "                                     script is running in. The type of condition can be given as <, > (default), =, <=, >=, or LIKE follow\n";
-print "                                     by a value. If like is choosen % can be used as wildcard character. Examples: 'coverage 50' or 'coverage\n";
-print "                                     < 10'. Several constraints can be given separated by semicolon (;). The constraints will be additive\n"; 
-print "                                     (AND). It is also possible to give SQL syntax directly. It will the be treated as added to the SQL statment\n"; 
-print "                                     after an AND. If you do not want the sequences but only the number of genes, you can give COUNT as the first\n";
-print "                                     condition. If NotFragmented is given, only genes that do not start or end at the first or last base of the scaffold\n";
-print "                                     is counted. If printing sequences it also only print sequences for which the first codon match a start codon and\n";
-print "                                     the last match a stop codon. This additional requirement when printing sequences mean that you may get a different\n";
-print "                                     number of sequences printed than the value you get when counting. Example:\n";
-print "                                         perl genomeDB.pl -db database.db --get_CDS \"coverage > 30; coverage<50;GC > 0.41; GC < 0.5\"\n";
+print "                                 type CDS) as nucleotide sequences. It is possible to give extra conditions for which sequences\n";
+print "                                 to print, e.g. coverage, proteinCoverage, GC, proteinGC, taxon, GO, GOname or GOname_space for\n";
+print "                                 limiting the output based on median coverage, GC content, taxon of of scaffold that the protein is\n";
+print "                                 coded on, median coverage, GC content of proteins, or GO number, GO number associated with certain\n";
+print "                                 name, or GO number belonging to a certain name space in the gene ontology_term. For the later two the\n";
+print "                                 file go.obo (http://geneontology.org/page/download-ontology) is needed to be in the same folder as the\n";
+print "                                 script is running in. The type of condition can be given as <, > (default), =, <=, >=, or LIKE follow\n";
+print "                                 by a value. If like is choosen % can be used as wildcard character. Examples: 'coverage 50' or 'coverage\n";
+print "                                 < 10'. Several constraints can be given separated by semicolon (;). The constraints will be additive\n"; 
+print "                                 (AND). It is also possible to give SQL syntax directly. It will the be treated as added to the SQL statment\n"; 
+print "                                 after an AND. If you do not want the sequences but only the number of genes, you can give COUNT as the first\n";
+print "                                 condition. If NotFragmented is given, only genes that do not start or end at the first or last base of the scaffold\n";
+print "                                 is counted. If printing sequences it also only print sequences for which the first codon match a start codon and\n";
+print "                                 the last match a stop codon. This additional requirement when printing sequences mean that you may get a different\n";
+print "                                 number of sequences printed than the value you get when counting. Example:\n";
+print "                                     perl genomeDB.pl -db database.db --get_CDS \"coverage > 30; coverage<50;GC > 0.41; GC < 0.5\"\n";
 print "--get_proteins                   Print protein coding genes (annotation type gene, including at least one streach with annotation\n";
-print "                                     type CDS) as aminoacid sequences. It is possible to give extra conditions for which sequences\n";
-print "                                     to print as for --get_CDS.\n";
+print "                                 type CDS) as aminoacid sequences. It is possible to give extra conditions for which sequences\n";
+print "                                 to print as for --get_CDS.\n";
 print "-R/--get_reads_of_scaffold       Print the reads that match given scaffold. The scaffold name should be the next argument and a\n";
-print "                                     bam file the next argument after that.\n";
+print "                                 bam file the next argument after that.\n";
 print "-T/--get_reads_of_taxon          Print the reads that match scaffolds of given taxon. The taxon should be given as next argument,\n";
-print "                                     % may be used as wildchard character, and a bam file should be the next argument after that.\n";
+print "                                 % may be used as wildchard character, and a bam file should be the next argument after that.\n";
 print "-h/--help                        Print this help.\n";
 print "--include_missmatch_mates        Include reads that do not match taxon/scaffold if their mate match.\n";
 print "--N/--note                       Set note annotation when reading scaffolds\n";
 print "--N50                            Get statistics, including N50, for scaffolds belonging to given taxon. The taxon must be the\n";
-print "                                     next argument, if the taxon is preceded by 'not ' it will give the statistics for scaffold\n";
-print "                                     not belonging to the taxon. If all (default) is given the statistics for all scaffolds will\n";
-print "                                     be given. If 'null' is given statistics will be provided for the scaffolds that do not have\n";
-print "                                     any taxon annotation. % may be used as wildchard character.\n";
+print "                                 next argument, if the taxon is preceded by 'not ' it will give the statistics for scaffold\n";
+print "                                 not belonging to the taxon. If all (default) is given the statistics for all scaffolds will\n";
+print "                                 be given. If 'null' is given statistics will be provided for the scaffolds that do not have\n";
+print "                                 any taxon annotation. % may be used as wildchard character.\n";
 print "-a/--read_annotations            Read annotations from GFF3 formated file. Can only read annotations for scaffolds that are in\n";
-print "                                     the database. File name given as next argument.\n";
-print "-b/--read_bam                    Read coverage and SNPs for scaffolds in the database from a bam file given as next argument. If\n";
-print "                                     you want to read Median coverage and SNPs for annotations too give anno as an extra argument\n";
+print "                                 the database. File name given as next argument.\n";
+print "-b/--read_bam                    Read coverage and SNPs for scaffolds in the database from a bam file, given as next argument. If\n";
+print "                                 you want to read Median coverage and SNPs for annotations too give anno as an extra argument\n";
+print "-v/--read_vcf                    Read SNPs for scaffolds in the database from a VCF file, given as next argument. If you want to read\n";
+print "                                 number of SNPs for annotations as well, give anno as an extra argument\n";
 print "-s/--read_scaffolds              Read scaffold data fasta file, given as next argument.\n";
 print "--set_genetic_code               Set the genetic code that will be used to translate base triplets into amino acids. eg. standard (default).\n";
 print "-S/--SNPscore_cutoff             Set base quality score cut-off to use for calling SNPs when reading bam file\n";
@@ -1031,6 +1223,7 @@ sub process_accno_search {
 		}
 		if (!(defined($FILE))) {
 		    # print "Getting taxon annotations: http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text\n";
+		   # print "Getting entry from NCBI: ", time,"\n";
 		    my $get= sequences::get_entry_from_GB($accno_string,$BLAST_GBdatabase); #get("http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=$BLAST_GBdatabase&id=$accno_string&rettype=gb&retmode=text");
 		    if ($get && $get =~ /^Resource temporarily unavailable/) { print STDERR "NCBI eutils temporarily unavailable.\n"; }
 		    elsif ($get) { @search = split /\n/, $get; }
@@ -1110,7 +1303,7 @@ sub process_accno_search {
 		    if ($taxon) { push @{$taxonomy[$#taxonomy]}, split /\s*;\s*/, $taxon }
 		    #else { print STDERR "Could not find taxon annotation for $accnos[$i].\n"; }
 		}
-		else { print STDERR "GB no accession number found for:\n\t $hits->[$i].\n"; }
+		else { print STDERR "No GB accession number found for:\n\t $hits->[$i].\n"; }
 	    }
 	    my $taxonstring='';
 	    my $scoresum=0;
@@ -1128,8 +1321,8 @@ sub process_accno_search {
 			if ($pos < scalar @{$taxonomy[$i]} || $pos < scalar @{$taxonomy[$i+1]}) {
 			    $check = 'T';
 			    if ($taxonomy[$i]->[$pos] && $taxonomy[$i+1]->[$pos] && $taxonomy[$i]->[$pos] ne $taxonomy[$i+1]->[$pos]) { $done = 'T'; last}
-			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos];}# print "$pos - $taxon\n" }
-			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos];}# print "$pos - $taxon\n" }
+			    elsif (!$taxon && $taxonomy[$i]->[$pos]) { $taxon = $taxonomy[$i]->[$pos];}
+			    elsif (!$taxon && $taxonomy[$i+1]->[$pos]) { $taxon = $taxonomy[$i+1]->[$pos];}
 			}
 		    }
 		    if ($check eq 'F') { $done = 'T'; }
@@ -1140,7 +1333,15 @@ sub process_accno_search {
 		    ++$pos;
 		}
 		if ($taxonstring) { $organism = $taxonstring; }
-		else { print STDERR "No taxon determined for $accno_string.\n"; }
+		else {
+		    print "No taxon determined for $accno_string.\n";
+		    if ($taxonomy[0] && $taxonomy[0]->[2]) {
+			print "\tKingdoms (score) of hits in order";
+			foreach (@taxonomy) { if ($_->[2]) { print ", ", $_->[2],' (', $_->[1], ')';} }
+			print "\n";
+			$organism = 'ambi';
+		    }
+	       	}
 	    }
 	    elsif (@taxonomy && $taxonomy[0]->[2]) {
 		$taxonstring = $taxonomy[0]->[2];
