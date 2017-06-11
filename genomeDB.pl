@@ -848,6 +848,8 @@ if ($dbh) {
 					print "BLAST based on $query say taxon should be '$taxon' for $scaffold.\n\tIt is now: $temp.\n";
 					if ($overwrite =~/T$/) { print "\tIt will be changed to: $taxon.\n"; ++$changed_annotations}
 				    }
+				    if ($temp eq $taxon) { $insert = 'F'; }
+				    elsif ($overwrite =~ /^C/ && $temp && $temp ne 'empty' && $temp =~ /^$taxon/) { ++$changed_annotations }
 				    #if ($overwrite =~/T$/) {
 					#if ($temp && $temp ne 'empty') {
 					#    $insert = 'F';
@@ -920,9 +922,11 @@ if ($dbh) {
 	    $sth_check->finish();
 	    if ($protein_query eq 'T') { $sth_protein->finish(); }
 	    my $output_string = "Added $added_taxa annotations ";
-	    if ($changed_annotations) { $output_string .= "of which $changed_annotations had previous taxonomic annotation "; }
+	    if ($changed_annotations) { $output_string .= "of which $changed_annotations had previous taxonomic annotation but were more specific"; }
 	    $output_string .= "(" . (time-$last_time) . "s). ";
-	    $output_string .= "$taxa_without_hit queries did not have any hit, and $taxa_with_unsignificant_hits did not have any hits with e-value below the cut off.\n";
+	    $output_string .= "$taxa_without_hit queries did not have any hit";
+	    if (defined($e_cut_off)) { $output_string .= ", and $taxa_with_unsignificant_hits did not have any hits with e-value below the cut off.\n"; }
+	    else { $output_string .= ".\n"; }
 	    print wrap('','',$output_string);
 	}
 	else { die "Need name of blast output file.\n"; }
